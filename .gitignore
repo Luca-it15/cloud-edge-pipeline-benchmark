@@ -1,0 +1,6 @@
+certs/*.crt
+certs/*.key
+__pycache__/
+*.pyc
+results/*.csv
+results/*.json

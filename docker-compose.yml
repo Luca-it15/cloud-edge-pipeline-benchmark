@@ -1,0 +1,211 @@
+services:
+  certgen:
+    build:
+      context: ./services/certgen
+    container_name: benchmark-certgen
+    environment:
+      CERT_DIR: /certs
+    volumes:
+      - ./certs:/certs
+
+  cloud-api:
+    build:
+      context: ./services/pipeline_api
+    container_name: benchmark-cloud-api
+    environment:
+      ROLE: cloud
+      SERVICE_NAME: cloud-api
+      PORT: 8000
+      NETWORK_UPLINK_MS: 80
+      PREPROCESS_MS: 24
+      INFERENCE_MS: 36
+      STORAGE_MS: 12
+      RESULT_PAYLOAD_RATIO: 0.05
+      SECURE_TLS_HANDSHAKE_MS: 18
+      SECURE_AUTH_MS: 4
+      SECURE_CRYPTO_MS_PER_MB: 7
+      SECURE_REPLAY_CHECK_MS: 2
+      SECURE_PACKET_OVERHEAD_KB: 2
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  cloud-api-tls:
+    build:
+      context: ./services/pipeline_api
+    container_name: benchmark-cloud-api-tls
+    environment:
+      ROLE: cloud
+      SERVICE_NAME: cloud-api-tls
+      PORT: 8443
+      CLOUD_SYNC_URL: ""
+      NETWORK_UPLINK_MS: 80
+      PREPROCESS_MS: 24
+      INFERENCE_MS: 36
+      STORAGE_MS: 12
+      RESULT_PAYLOAD_RATIO: 0.05
+      TLS_CERT_FILE: /certs/cloud-api-tls.crt
+      TLS_KEY_FILE: /certs/cloud-api-tls.key
+      TLS_CA_FILE: /certs/ca.crt
+      TLS_REQUIRE_CLIENT_CERT: "true"
+      TLS_CLIENT_CERT_FILE: /certs/client.crt
+      TLS_CLIENT_KEY_FILE: /certs/client.key
+      SECURE_TLS_HANDSHAKE_MS: 18
+      SECURE_AUTH_MS: 4
+      SECURE_CRYPTO_MS_PER_MB: 7
+      SECURE_REPLAY_CHECK_MS: 2
+      SECURE_PACKET_OVERHEAD_KB: 2
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./certs:/certs:ro
+    depends_on:
+      certgen:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.healthcheck", "https://localhost:8443/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  edge-api:
+    build:
+      context: ./services/pipeline_api
+    container_name: benchmark-edge-api
+    environment:
+      ROLE: edge
+      SERVICE_NAME: edge-api
+      PORT: 8000
+      CLOUD_SYNC_URL: http://cloud-api:8000/sync
+      NETWORK_UPLINK_MS: 8
+      PREPROCESS_MS: 42
+      INFERENCE_MS: 76
+      STORAGE_MS: 8
+      RESULT_PAYLOAD_RATIO: 0.05
+      SECURE_TLS_HANDSHAKE_MS: 18
+      SECURE_AUTH_MS: 4
+      SECURE_CRYPTO_MS_PER_MB: 7
+      SECURE_REPLAY_CHECK_MS: 2
+      SECURE_PACKET_OVERHEAD_KB: 2
+    ports:
+      - "8001:8000"
+    cpus: "1.0"
+    mem_limit: 512m
+    depends_on:
+      cloud-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  edge-api-tls:
+    build:
+      context: ./services/pipeline_api
+    container_name: benchmark-edge-api-tls
+    environment:
+      ROLE: edge
+      SERVICE_NAME: edge-api-tls
+      PORT: 8443
+      CLOUD_SYNC_URL: https://cloud-api-tls:8443/sync
+      NETWORK_UPLINK_MS: 8
+      PREPROCESS_MS: 42
+      INFERENCE_MS: 76
+      STORAGE_MS: 8
+      RESULT_PAYLOAD_RATIO: 0.05
+      TLS_CERT_FILE: /certs/edge-api-tls.crt
+      TLS_KEY_FILE: /certs/edge-api-tls.key
+      TLS_CA_FILE: /certs/ca.crt
+      TLS_REQUIRE_CLIENT_CERT: "true"
+      TLS_CLIENT_CERT_FILE: /certs/client.crt
+      TLS_CLIENT_KEY_FILE: /certs/client.key
+      SECURE_TLS_HANDSHAKE_MS: 18
+      SECURE_AUTH_MS: 4
+      SECURE_CRYPTO_MS_PER_MB: 7
+      SECURE_REPLAY_CHECK_MS: 2
+      SECURE_PACKET_OVERHEAD_KB: 2
+    ports:
+      - "8444:8443"
+    cpus: "1.0"
+    mem_limit: 512m
+    volumes:
+      - ./certs:/certs:ro
+    depends_on:
+      cloud-api-tls:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.healthcheck", "https://localhost:8443/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  benchmark:
+    build:
+      context: ./services/benchmark
+    container_name: benchmark-runner
+    environment:
+      CLOUD_URL: http://cloud-api:8000/process
+      EDGE_URL: http://edge-api:8000/process
+      CLOUD_TLS_URL: https://cloud-api-tls:8443/process
+      EDGE_TLS_URL: https://edge-api-tls:8443/process
+      TLS_CA_FILE: /certs/ca.crt
+      TLS_CLIENT_CERT_FILE: /certs/client.crt
+      TLS_CLIENT_KEY_FILE: /certs/client.key
+      RUNS: 30
+      DATA_SIZE_KB: 512
+      COMPLEXITY: 1.0
+      OUTPUT_DIR: /app/results
+      REQUEST_TIMEOUT_SECONDS: 30
+    volumes:
+      - ./results:/app/results
+      - ./certs:/certs:ro
+    depends_on:
+      cloud-api:
+        condition: service_healthy
+      edge-api:
+        condition: service_healthy
+      cloud-api-tls:
+        condition: service_healthy
+      edge-api-tls:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: benchmark-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./certs:/certs:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      cloud-api:
+        condition: service_healthy
+      edge-api:
+        condition: service_healthy
+      cloud-api-tls:
+        condition: service_healthy
+      edge-api-tls:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: benchmark-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus

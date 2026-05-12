@@ -1,0 +1,40 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: cloud-api
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - cloud-api:8000
+
+  - job_name: edge-api
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - edge-api:8000
+
+  - job_name: cloud-api-tls
+    scheme: https
+    metrics_path: /metrics
+    tls_config:
+      ca_file: /certs/ca.crt
+      cert_file: /certs/client.crt
+      key_file: /certs/client.key
+      server_name: cloud-api-tls
+    static_configs:
+      - targets:
+          - cloud-api-tls:8443
+
+  - job_name: edge-api-tls
+    scheme: https
+    metrics_path: /metrics
+    tls_config:
+      ca_file: /certs/ca.crt
+      cert_file: /certs/client.crt
+      key_file: /certs/client.key
+      server_name: edge-api-tls
+    static_configs:
+      - targets:
+          - edge-api-tls:8443

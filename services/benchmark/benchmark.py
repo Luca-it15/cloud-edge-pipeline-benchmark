@@ -18,8 +18,8 @@ EDGE_TLS_URL = os.getenv("EDGE_TLS_URL", "https://edge-api-tls:8443/process")
 TLS_CA_FILE = os.getenv("TLS_CA_FILE", "")
 TLS_CLIENT_CERT_FILE = os.getenv("TLS_CLIENT_CERT_FILE", "")
 TLS_CLIENT_KEY_FILE = os.getenv("TLS_CLIENT_KEY_FILE", "")
-RUNS = int(os.getenv("RUNS", "30"))
-DATA_SIZE_KB = int(os.getenv("DATA_SIZE_KB", "512"))
+DATASET_PATH = Path(os.getenv("DATASET_PATH", "/app/data/patients.json"))
+DATASET_REPEATS = int(os.getenv("DATASET_REPEATS", "1"))
 COMPLEXITY = float(os.getenv("COMPLEXITY", "1.0"))
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "/app/results"))
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
@@ -29,6 +29,11 @@ FIELDS = [
     "pipeline",
     "run_id",
     "input_id",
+    "patient_id",
+    "patient_name",
+    "ward",
+    "bed",
+    "diagnosis",
     "client_total_ms",
     "service_total_ms",
     "client_service_delta_ms",
@@ -48,6 +53,11 @@ FIELDS = [
     "payload_synced_kb",
     "result_payload_kb",
     "security_overhead_kb",
+    "risk_score",
+    "risk_level",
+    "recommended_action",
+    "processing_mode",
+    "alert",
 ]
 
 
@@ -85,6 +95,9 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "mean_sync_ms": statistics.fmean(float(row["sync_ms"]) for row in subset),
             "mean_payload_sent_kb": statistics.fmean(float(row["payload_sent_kb"]) for row in subset),
             "mean_payload_synced_kb": statistics.fmean(float(row["payload_synced_kb"]) for row in subset),
+            "alerts": sum(1 for row in subset if row["alert"] == "true"),
+            "critical_patients": sum(1 for row in subset if row["risk_level"] == "critical"),
+            "high_patients": sum(1 for row in subset if row["risk_level"] == "high"),
         }
     return summary
 
@@ -104,14 +117,15 @@ async def run_one(
     pipeline: str,
     security_profile: str,
     run_id: int,
+    patient: dict[str, Any],
 ) -> dict[str, Any]:
     suffix = security_profile if security_profile != "none" else "plain"
-    input_id = f"{pipeline}-{suffix}-{run_id:04d}"
+    input_id = f"{pipeline}-{suffix}-{patient['patient_id']}-{run_id:04d}"
     payload = {
         "input_id": input_id,
-        "data_size_kb": DATA_SIZE_KB,
         "complexity": COMPLEXITY,
         "security_profile": security_profile,
+        "patient_record": patient,
     }
 
     start = time.perf_counter()
@@ -126,11 +140,18 @@ async def run_one(
     body = response.json()
     timings = body["timings_ms"]
     service_total_ms = float(body["total_ms"])
+    clinical = body["clinical"]
+    risk = clinical["risk"] or {}
 
     return {
         "pipeline": body["pipeline"],
         "run_id": run_id,
         "input_id": input_id,
+        "patient_id": patient["patient_id"],
+        "patient_name": patient["name"],
+        "ward": patient["ward"],
+        "bed": patient["bed"],
+        "diagnosis": patient["primary_diagnosis"],
         "client_total_ms": round(client_total_ms, 3),
         "service_total_ms": round(service_total_ms, 3),
         "client_service_delta_ms": round(client_total_ms - service_total_ms, 3),
@@ -150,11 +171,99 @@ async def run_one(
         "payload_synced_kb": round(float(body["payload_synced_kb"]), 3),
         "result_payload_kb": round(float(body["result_payload_kb"]), 3),
         "security_overhead_kb": round(float(body.get("security_overhead_kb", 0.0)), 3),
+        "risk_score": risk.get("risk_score", 0),
+        "risk_level": risk.get("risk_level", "unknown"),
+        "recommended_action": risk.get("recommended_action", ""),
+        "processing_mode": clinical["processing_mode"],
+        "alert": "true" if clinical["alert"] else "false",
+        "_clinical": clinical,
+    }
+
+
+def load_patients() -> list[dict[str, Any]]:
+    patients = json.loads(DATASET_PATH.read_text(encoding="utf-8"))
+    if not isinstance(patients, list) or not patients:
+        raise ValueError(f"Dataset must be a non-empty JSON list: {DATASET_PATH}")
+    return patients
+
+
+def dashboard_payload(rows: list[dict[str, Any]], patients: list[dict[str, Any]], summary: dict[str, Any]) -> dict[str, Any]:
+    patient_index = {patient["patient_id"]: patient for patient in patients}
+    latest_by_patient: dict[str, dict[str, Any]] = {}
+    comparisons: dict[str, dict[str, Any]] = {}
+
+    for row in rows:
+        patient_id = row["patient_id"]
+        comparisons.setdefault(patient_id, {})[row["pipeline"]] = {
+            "client_total_ms": row["client_total_ms"],
+            "service_total_ms": row["service_total_ms"],
+            "sync_ms": row["sync_ms"],
+            "payload_synced_kb": row["payload_synced_kb"],
+            "risk_score": row["risk_score"],
+            "risk_level": row["risk_level"],
+        }
+        if row["pipeline"] in {"edge", "edge_tls"}:
+            current = latest_by_patient.get(patient_id)
+            if current is None or row["pipeline"] == "edge_tls":
+                latest_by_patient[patient_id] = row
+
+    patients_payload = []
+    for patient_id, row in latest_by_patient.items():
+        patient = patient_index[patient_id]
+        latest_vitals = patient["vitals"][-1]
+        patients_payload.append(
+            {
+                "patient_id": patient_id,
+                "name": patient["name"],
+                "age": patient["age"],
+                "sex": patient["sex"],
+                "ward": patient["ward"],
+                "bed": patient["bed"],
+                "diagnosis": patient["primary_diagnosis"],
+                "comorbidities": patient.get("comorbidities", []),
+                "medications": patient.get("medications", []),
+                "latest_vitals": latest_vitals,
+                "risk_score": row["risk_score"],
+                "risk_level": row["risk_level"],
+                "recommended_action": row["recommended_action"],
+                "alert": row["alert"] == "true",
+                "pipeline_comparison": comparisons.get(patient_id, {}),
+            }
+        )
+
+    risk_counts: dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    for patient in patients_payload:
+        risk_counts[patient["risk_level"]] = risk_counts.get(patient["risk_level"], 0) + 1
+
+    ward_counts: dict[str, dict[str, int]] = {}
+    for patient in patients_payload:
+        ward = patient["ward"]
+        ward_counts.setdefault(ward, {"patients": 0, "alerts": 0})
+        ward_counts[ward]["patients"] += 1
+        if patient["alert"]:
+            ward_counts[ward]["alerts"] += 1
+
+    return {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "dataset_size": len(patients),
+        "scenarios": sorted(summary.keys()),
+        "summary": summary,
+        "risk_counts": risk_counts,
+        "ward_counts": ward_counts,
+        "patients": sorted(
+            patients_payload,
+            key=lambda item: ({"critical": 0, "high": 1, "medium": 2, "low": 3}.get(item["risk_level"], 9), item["ward"]),
+        ),
+        "results": [
+            {key: value for key, value in row.items() if not key.startswith("_")}
+            for row in rows
+        ],
     }
 
 
 async def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    patients = load_patients()
     rows: list[dict[str, Any]] = []
 
     targets = [
@@ -166,30 +275,38 @@ async def main() -> None:
         ("edge_tls", EDGE_TLS_URL, "edge", "tls"),
     ]
 
-    for run_id in range(1, RUNS + 1):
-        run_rows = []
-        for _, url, pipeline, security_profile in targets:
-            row = await run_one(url, pipeline, security_profile, run_id)
-            run_rows.append(row)
-            rows.append(row)
-        print(
-            f"run={run_id:03d} "
-            + " ".join(f"{row['pipeline']}={row['client_total_ms']:.1f}ms" for row in run_rows),
-            flush=True,
-        )
+    run_id = 0
+    for repeat in range(1, DATASET_REPEATS + 1):
+        for patient in patients:
+            run_id += 1
+            run_rows = []
+            for _, url, pipeline, security_profile in targets:
+                row = await run_one(url, pipeline, security_profile, run_id, patient)
+                run_rows.append(row)
+                rows.append(row)
+            max_risk = max(row["risk_score"] for row in run_rows)
+            print(
+                f"patient={patient['patient_id']} repeat={repeat} max_risk={max_risk} "
+                + " ".join(f"{row['pipeline']}={row['client_total_ms']:.1f}ms" for row in run_rows),
+                flush=True,
+            )
 
     results_path = OUTPUT_DIR / "results.csv"
     with results_path.open("w", newline="", encoding="utf-8") as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=FIELDS)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows([{key: row[key] for key in FIELDS} for row in rows])
 
     summary = summarize(rows)
     summary_path = OUTPUT_DIR / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
+    dashboard_path = OUTPUT_DIR / "patient_results.json"
+    dashboard_path.write_text(json.dumps(dashboard_payload(rows, patients, summary), indent=2), encoding="utf-8")
+
     print(f"wrote {results_path}")
     print(f"wrote {summary_path}")
+    print(f"wrote {dashboard_path}")
     print(json.dumps(summary, indent=2))
 
 

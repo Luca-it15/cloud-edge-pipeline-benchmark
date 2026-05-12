@@ -10,6 +10,12 @@ from fastapi import FastAPI, Response
 from pydantic import BaseModel, Field
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
+from app.clinical import (
+    cloud_pipeline_result,
+    edge_pipeline_result,
+    payload_size_kb,
+)
+
 
 ROLE = os.getenv("ROLE", "cloud").lower()
 SERVICE_NAME = os.getenv("SERVICE_NAME", ROLE)
@@ -77,6 +83,7 @@ class ProcessRequest(BaseModel):
     data_size_kb: int = Field(512, ge=1, le=65536)
     complexity: float = Field(1.0, ge=0.1, le=10.0)
     security_profile: Literal["none", "secure", "simulated", "tls"] = "none"
+    patient_record: dict[str, Any] | None = None
 
 
 class SyncRequest(BaseModel):
@@ -84,6 +91,7 @@ class SyncRequest(BaseModel):
     source: str = "edge"
     result_payload_kb: float
     security_profile: Literal["none", "secure", "simulated", "tls"] = "none"
+    clinical_summary: dict[str, Any] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -174,6 +182,7 @@ async def sync_to_cloud(
     result_payload_kb: float,
     local_timings: dict[str, float],
     security_profile: str,
+    clinical_summary: dict[str, Any] | None,
 ) -> float:
     if not CLOUD_SYNC_URL:
         return 0.0
@@ -184,6 +193,7 @@ async def sync_to_cloud(
         "source": "edge",
         "result_payload_kb": result_payload_kb,
         "security_profile": security_profile,
+        "clinical_summary": clinical_summary,
         "metadata": {"local_timings_ms": local_timings},
     }
     try:
@@ -211,7 +221,8 @@ async def process(request: ProcessRequest) -> dict[str, Any]:
     security_profile = normalize_security_profile(request.security_profile)
     pipeline = pipeline_label(base_pipeline, security_profile)
     REQUESTS.labels(SERVICE_NAME, pipeline, "process").inc()
-    PAYLOAD_SIZE.labels(SERVICE_NAME, pipeline, "input").observe(request.data_size_kb)
+    payload_sent_kb = payload_size_kb(request.patient_record) if request.patient_record else float(request.data_size_kb)
+    PAYLOAD_SIZE.labels(SERVICE_NAME, pipeline, "input").observe(payload_sent_kb)
     IN_FLIGHT.labels(SERVICE_NAME, pipeline).inc()
 
     total_start = now_ms()
@@ -220,12 +231,29 @@ async def process(request: ProcessRequest) -> dict[str, Any]:
         security_timings = await apply_security_profile(
             security_profile,
             pipeline,
-            float(request.data_size_kb),
+            payload_sent_kb,
         )
-        preprocess_ms = await timed_cpu_stage("preprocess", pipeline, PREPROCESS_MS * request.complexity)
-        inference_ms = await timed_cpu_stage("inference", pipeline, INFERENCE_MS * request.complexity)
 
-        result_payload_kb = max(1.0, request.data_size_kb * RESULT_PAYLOAD_RATIO)
+        if request.patient_record:
+            preprocess_ms = await timed_cpu_stage("clinical_preprocess", pipeline, PREPROCESS_MS * request.complexity)
+            if base_pipeline == "cloud":
+                clinical_result = cloud_pipeline_result(request.patient_record)
+            else:
+                clinical_result = edge_pipeline_result(request.patient_record)
+            inference_ms = await timed_cpu_stage("clinical_risk_scoring", pipeline, INFERENCE_MS * request.complexity)
+            result_payload_kb = payload_size_kb(clinical_result["clinical_payload"])
+        else:
+            preprocess_ms = await timed_cpu_stage("preprocess", pipeline, PREPROCESS_MS * request.complexity)
+            inference_ms = await timed_cpu_stage("inference", pipeline, INFERENCE_MS * request.complexity)
+            result_payload_kb = max(1.0, payload_sent_kb * RESULT_PAYLOAD_RATIO)
+            clinical_result = {
+                "processing_mode": "synthetic_payload",
+                "validation_errors": [],
+                "risk": None,
+                "alert": False,
+                "clinical_payload": {},
+            }
+
         PAYLOAD_SIZE.labels(SERVICE_NAME, pipeline, "result").observe(result_payload_kb)
 
         timings = {
@@ -239,13 +267,14 @@ async def process(request: ProcessRequest) -> dict[str, Any]:
             storage_ms = await timed_async_sleep("storage", pipeline, STORAGE_MS)
             timings["storage_ms"] = storage_ms
             timings["sync_ms"] = 0.0
-            payload_synced_kb = request.data_size_kb
+            payload_synced_kb = payload_sent_kb
         else:
             sync_ms = await sync_to_cloud(
                 request.input_id,
                 result_payload_kb,
                 timings,
                 security_profile,
+                clinical_result["clinical_payload"],
             )
             STAGE_LATENCY.labels(SERVICE_NAME, pipeline, "cloud_sync").observe(sync_ms)
             timings["storage_ms"] = 0.0
@@ -261,10 +290,11 @@ async def process(request: ProcessRequest) -> dict[str, Any]:
             "security_profile": security_profile,
             "transport_security": "tls" if TLS_CERT_FILE else "plain",
             "input_id": request.input_id,
-            "payload_sent_kb": request.data_size_kb,
+            "payload_sent_kb": payload_sent_kb,
             "payload_synced_kb": payload_synced_kb,
             "result_payload_kb": result_payload_kb,
             "security_overhead_kb": security_timings["security_overhead_kb"],
+            "clinical": clinical_result,
             "timings_ms": timings,
             "total_ms": total_ms,
         }
@@ -291,6 +321,8 @@ async def sync(request: SyncRequest) -> dict[str, Any]:
         "source": request.source,
         "security_profile": security_profile,
         "transport_security": "tls" if TLS_CERT_FILE else "plain",
+        "stored_payload": "edge_reduced_clinical_summary",
+        "clinical_summary": request.clinical_summary,
         "security_ms": security_timings["security_ms"],
         "storage_ms": storage_ms,
     }

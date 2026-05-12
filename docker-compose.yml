@@ -148,6 +148,8 @@ services:
     build:
       context: ./services/benchmark
     container_name: benchmark-runner
+    profiles:
+      - benchmark
     environment:
       CLOUD_URL: http://cloud-api:8000/process
       EDGE_URL: http://edge-api:8000/process
@@ -156,14 +158,15 @@ services:
       TLS_CA_FILE: /certs/ca.crt
       TLS_CLIENT_CERT_FILE: /certs/client.crt
       TLS_CLIENT_KEY_FILE: /certs/client.key
-      RUNS: 30
-      DATA_SIZE_KB: 512
+      DATASET_PATH: /app/data/patients.json
+      DATASET_REPEATS: 1
       COMPLEXITY: 1.0
       OUTPUT_DIR: /app/results
       REQUEST_TIMEOUT_SECONDS: 30
     volumes:
       - ./results:/app/results
       - ./certs:/certs:ro
+      - ./data:/app/data:ro
     depends_on:
       cloud-api:
         condition: service_healthy
@@ -173,6 +176,20 @@ services:
         condition: service_healthy
       edge-api-tls:
         condition: service_healthy
+
+  hospital-dashboard:
+    build:
+      context: ./services/hospital_dashboard
+    container_name: benchmark-hospital-dashboard
+    environment:
+      DATASET_PATH: /app/data/patients.json
+      RESULTS_PATH: /app/results/patient_results.json
+      PORT: 8080
+    volumes:
+      - ./data:/app/data:ro
+      - ./results:/app/results:ro
+    ports:
+      - "8080:8080"
 
   prometheus:
     image: prom/prometheus:v2.55.1

@@ -1,65 +1,132 @@
-# Benchmark pipeline Cloud vs Edge
+# Benchmark clinico Cloud vs Edge
 
-Questa demo confronta pipeline cloud ed edge con tre livelli di comunicazione:
+Questo progetto confronta due pipeline di monitoraggio pazienti:
 
-- **plain**: HTTP senza sicurezza di trasporto.
-- **simulated secure**: HTTP plain, ma con overhead applicativo simulato per TLS/HMAC/cifratura/replay check.
-- **TLS reale**: HTTPS reale con CA locale self-signed e certificato client per mTLS.
+- **Cloud pipeline**: il record clinico completo del paziente viene inviato al cloud, dove vengono eseguiti tutti i processamenti.
+- **Edge pipeline**: il record viene processato vicino al letto/reparto, viene generato un alert locale e al cloud viene inviato solo un summary ridotto.
 
-Il benchmark scrive:
+Il benchmark usa un dataset fittizio ma realistico di 20 pazienti in [data/patients.json](data/patients.json), con reparto, letto, diagnosi, comorbidita', farmaci e serie temporale di parametri vitali.
 
-- `results/results.csv`: una riga per ogni richiesta.
-- `results/summary.json`: statistiche aggregate per pipeline.
-- metriche Prometheus esposte da tutte le API.
-- dashboard Grafana gia' provisionata.
+## Cosa viene processato
 
-## Avvio completo
-
-Da questa cartella:
-
-```powershell
-docker compose up --build
-```
-
-Questo comando:
-
-1. genera certificati locali nel volume `certs/` tramite `certgen`;
-2. avvia la pipeline cloud plain;
-3. avvia la pipeline edge plain;
-4. avvia la pipeline cloud TLS;
-5. avvia la pipeline edge TLS;
-6. avvia Prometheus;
-7. avvia Grafana.
-
-Servizi disponibili:
+Ogni paziente contiene:
 
 ```text
-Cloud API plain:      http://localhost:8000/docs
-Edge API plain:       http://localhost:8001/docs
-Cloud API TLS/mTLS:   https://localhost:8443/docs
-Edge API TLS/mTLS:    https://localhost:8444/docs
-Prometheus:           http://localhost:9090
-Grafana:              http://localhost:3000
+patient_id, name, age, sex
+ward, bed
+primary_diagnosis
+comorbidities
+medications
+vitals[]:
+  timestamp
+  heart_rate
+  systolic_bp
+  respiratory_rate
+  spo2
+  temperature
+  glucose
 ```
 
-Grafana:
+La logica clinica e' in:
 
 ```text
-user: admin
-password: admin
+services/pipeline_api/app/clinical.py
 ```
 
-Nota: gli endpoint TLS richiedono certificati self-signed locali. Il browser potrebbe non aprire `/docs` senza importare la CA e il certificato client; il benchmark invece li usa automaticamente.
+Vengono calcolati:
 
-## Lanciare il benchmark
+- validazione schema;
+- pulizia/range clamping dei parametri vitali;
+- filtro moving average sull'edge;
+- feature cliniche: ultimo valore, medie, trend;
+- score vitali;
+- score trend;
+- score contesto clinico;
+- livello di rischio: `low`, `medium`, `high`, `critical`;
+- azione raccomandata;
+- alert se rischio `high` o `critical`.
 
-Con i servizi gia' attivi:
+## Pipeline cloud nel dettaglio
 
-```powershell
-docker compose run --rm benchmark
+La pipeline cloud riceve il record completo del paziente.
+
+```text
+benchmark client
+  -> cloud-api /process
+  -> network delay simulato
+  -> validazione record
+  -> normalizzazione parametri vitali
+  -> feature extraction su tutta la serie temporale
+  -> risk scoring
+  -> triage / alert
+  -> storage del record completo
+  -> risposta al client
 ```
 
-Il runner esegue, per ogni run:
+Informazioni inviate al cloud:
+
+```text
+demografia completa
+reparto e letto
+diagnosi
+comorbidita'
+farmaci
+serie completa dei parametri vitali
+```
+
+Informazioni salvate dal cloud:
+
+```text
+full patient record
+full vital time-series
+risk assessment
+triage recommendation
+```
+
+## Pipeline edge nel dettaglio
+
+La pipeline edge riceve il record del paziente, ma processa localmente i dati e sincronizza al cloud solo un risultato ridotto.
+
+```text
+benchmark client
+  -> edge-api /process
+  -> network delay locale simulato
+  -> validazione record
+  -> clamping parametri vitali
+  -> filtro moving average
+  -> feature extraction locale
+  -> early warning score
+  -> alert locale
+  -> sync al cloud del summary ridotto
+  -> risposta al client
+```
+
+Informazioni usate localmente dall'edge:
+
+```text
+record completo del paziente
+serie completa dei parametri vitali
+```
+
+Informazioni inviate dall'edge al cloud:
+
+```text
+patient_id
+patient_hash pseudonimizzato
+ward
+bed
+latest_vitals
+risk_score
+risk_level
+recommended_action
+alert
+```
+
+Quindi il cloud non riceve piu' tutta la serie clinica grezza, ma solo il risultato operativo necessario per dashboard, alerting e audit.
+
+## Scenari benchmark
+
+Per ogni paziente vengono eseguiti sei scenari:
 
 ```text
 cloud
@@ -70,158 +137,104 @@ cloud_tls
 edge_tls
 ```
 
-Quindi confronta:
+- `cloud`: processing completo in cloud via HTTP.
+- `edge`: processing locale edge via HTTP, sync ridotto al cloud.
+- `*_simulated_secure`: aggiunge delay simulato per TLS/HMAC/cifratura/anti-replay.
+- `*_tls`: usa HTTPS/mTLS reale con CA locale e certificato client.
 
-- cloud vs edge;
-- overhead di sicurezza simulato;
-- overhead TLS/mTLS reale osservato dal client;
-- differenza di banda logica tra dato grezzo inviato al cloud e risultato ridotto sincronizzato dall'edge.
-
-## Flusso delle pipeline
-
-Pipeline cloud plain:
-
-```text
-client -> cloud-api HTTP -> network simulated -> preprocessing -> inference -> storage
-```
-
-Pipeline edge plain:
-
-```text
-client -> edge-api HTTP -> network simulated -> preprocessing -> inference -> sync result to cloud
-```
-
-Pipeline cloud TLS:
-
-```text
-client -> HTTPS/mTLS -> cloud-api-tls -> network simulated -> preprocessing -> inference -> storage
-```
-
-Pipeline edge TLS:
-
-```text
-client -> HTTPS/mTLS -> edge-api-tls -> network simulated -> preprocessing -> inference -> HTTPS/mTLS sync to cloud-api-tls
-```
-
-## Campi importanti nel CSV
-
-Il file `results/results.csv` contiene:
-
-```text
-pipeline
-client_total_ms
-service_total_ms
-client_service_delta_ms
-security_profile
-transport_security
-network_ms
-security_ms
-tls_handshake_ms
-auth_ms
-crypto_ms
-replay_check_ms
-preprocess_ms
-inference_ms
-storage_ms
-sync_ms
-payload_sent_kb
-payload_synced_kb
-security_overhead_kb
-```
-
-Interpretazione:
-
-- `client_total_ms`: latenza end-to-end vista dal client.
-- `service_total_ms`: tempo misurato dentro l'API, dopo che la richiesta e' arrivata.
-- `client_service_delta_ms`: differenza tra client e servizio. Nei casi TLS include handshake TLS/mTLS, setup connessione, serializzazione e overhead HTTP.
-- `security_ms`: overhead applicativo simulato, usato solo nei casi `*_simulated_secure`.
-- `transport_security`: `plain` oppure `tls`.
-- `sync_ms`: per edge, include la sincronizzazione del risultato verso cloud.
-- `payload_synced_kb`: nel cloud e' il dato grezzo; nell'edge e' il risultato ridotto.
-
-## Configurare i benchmark
-
-Modifica `docker-compose.yml`.
-
-Parametri principali:
-
-```yaml
-RUNS: 30
-DATA_SIZE_KB: 512
-COMPLEXITY: 1.0
-NETWORK_UPLINK_MS: 80
-PREPROCESS_MS: 24
-INFERENCE_MS: 36
-STORAGE_MS: 12
-```
-
-Parametri per sicurezza simulata:
-
-```yaml
-SECURE_TLS_HANDSHAKE_MS: 18
-SECURE_AUTH_MS: 4
-SECURE_CRYPTO_MS_PER_MB: 7
-SECURE_REPLAY_CHECK_MS: 2
-SECURE_PACKET_OVERHEAD_KB: 2
-```
-
-Limiti edge:
-
-```yaml
-cpus: "1.0"
-mem_limit: 512m
-```
-
-## Comandi utili
-
-Avvio completo:
+## Avvio
 
 ```powershell
 docker compose up --build
 ```
 
-Avvio in background:
+Servizi:
 
-```powershell
-docker compose up -d --build
+```text
+Cloud API plain:       http://localhost:8000/docs
+Edge API plain:        http://localhost:8001/docs
+Cloud API TLS/mTLS:    https://localhost:8443/docs
+Edge API TLS/mTLS:     https://localhost:8444/docs
+Hospital dashboard:    http://localhost:8080
+Prometheus:            http://localhost:9090
+Grafana:               http://localhost:3000
 ```
 
-Eseguire benchmark:
+Grafana:
+
+```text
+user: admin
+password: admin
+```
+
+## Lanciare il benchmark clinico
 
 ```powershell
 docker compose run --rm benchmark
 ```
 
-Vedere stato container:
+Output:
 
-```powershell
-docker compose ps
+```text
+results/results.csv
+results/summary.json
+results/patient_results.json
 ```
 
-Vedere log:
+`patient_results.json` alimenta la dashboard ospedaliera.
 
-```powershell
-docker compose logs -f cloud-api edge-api cloud-api-tls edge-api-tls
+## Dashboard ospedaliera
+
+Apri:
+
+```text
+http://localhost:8080
 ```
 
-Fermare tutto:
+La dashboard mostra:
 
-```powershell
-docker compose down
+- lista pazienti per reparto;
+- livello di rischio;
+- score clinico;
+- parametri vitali piu' recenti;
+- diagnosi, farmaci, comorbidita';
+- azione raccomandata;
+- confronto cloud/edge/TLS per latenza, sync e payload inviato al cloud;
+- carico per reparto e alert attivi.
+
+## Prometheus e Grafana
+
+Prometheus raccoglie metriche runtime dagli endpoint `/metrics`:
+
+```text
+pipeline_requests_total
+pipeline_total_latency_ms
+pipeline_stage_latency_ms
+pipeline_payload_size_kb
+pipeline_in_flight_requests
 ```
 
-Rigenerare i certificati:
+Grafana visualizza queste metriche nel tempo. La dashboard ospedaliera invece visualizza i risultati clinici del benchmark.
 
-```powershell
-docker compose run --rm -e FORCE_REGENERATE_CERTS=1 certgen
-docker compose up -d --build
+## File principali
+
+```text
+data/patients.json                         dataset pazienti
+services/pipeline_api/app/clinical.py      logica clinica
+services/pipeline_api/app/main.py          API cloud/edge
+services/benchmark/benchmark.py            runner benchmark
+services/hospital_dashboard/app/main.py    gestionale ospedaliero
+docker-compose.yml                         orchestrazione
+docs/cloud-edge-pipeline-benchmark-report.pdf
 ```
 
-## Sicurezza modellata
+## Note sicurezza
 
-La demo ora ha due tipi di sicurezza:
+I certificati TLS sono generati localmente da `certgen` e ignorati da Git:
 
-- `*_simulated_secure`: misura un overhead controllato e configurabile per spiegare il costo di TLS, HMAC/token, cifratura e anti-replay.
-- `*_tls`: usa HTTPS reale con certificati generati localmente. Il client verifica la CA locale e presenta un certificato client per mTLS.
+```text
+certs/*.crt
+certs/*.key
+```
 
-Per una tesi o relazione, puoi usare `*_simulated_secure` per spiegare i singoli contributi teorici e `*_tls` per mostrare una misura reale di trasporto.
+Sono adatti per benchmark locale, non per produzione.

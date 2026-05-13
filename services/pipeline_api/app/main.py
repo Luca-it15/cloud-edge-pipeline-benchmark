@@ -27,6 +27,7 @@ TLS_CA_FILE = os.getenv("TLS_CA_FILE", "")
 TLS_REQUIRE_CLIENT_CERT = os.getenv("TLS_REQUIRE_CLIENT_CERT", "false").lower() == "true"
 TLS_CLIENT_CERT_FILE = os.getenv("TLS_CLIENT_CERT_FILE", "")
 TLS_CLIENT_KEY_FILE = os.getenv("TLS_CLIENT_KEY_FILE", "")
+TRANSPORT_SECURITY = os.getenv("TRANSPORT_SECURITY", "tls" if TLS_CERT_FILE else "plain")
 
 NETWORK_UPLINK_MS = float(os.getenv("NETWORK_UPLINK_MS", "0"))
 PREPROCESS_MS = float(os.getenv("PREPROCESS_MS", "20"))
@@ -269,17 +270,19 @@ async def process(request: ProcessRequest) -> dict[str, Any]:
             timings["sync_ms"] = 0.0
             payload_synced_kb = payload_sent_kb
         else:
-            sync_ms = await sync_to_cloud(
-                request.input_id,
-                result_payload_kb,
-                timings,
-                security_profile,
-                clinical_result["clinical_payload"],
-            )
-            STAGE_LATENCY.labels(SERVICE_NAME, pipeline, "cloud_sync").observe(sync_ms)
+            sync_ms = 0.0
+            if CLOUD_SYNC_URL:
+                sync_ms = await sync_to_cloud(
+                    request.input_id,
+                    result_payload_kb,
+                    timings,
+                    security_profile,
+                    clinical_result["clinical_payload"],
+                )
+                STAGE_LATENCY.labels(SERVICE_NAME, pipeline, "cloud_sync").observe(sync_ms)
             timings["storage_ms"] = 0.0
             timings["sync_ms"] = sync_ms
-            payload_synced_kb = result_payload_kb
+            payload_synced_kb = result_payload_kb if CLOUD_SYNC_URL else 0.0
 
         total_ms = now_ms() - total_start
         TOTAL_LATENCY.labels(SERVICE_NAME, pipeline).observe(total_ms)
@@ -288,7 +291,7 @@ async def process(request: ProcessRequest) -> dict[str, Any]:
             "pipeline": pipeline,
             "service": SERVICE_NAME,
             "security_profile": security_profile,
-            "transport_security": "tls" if TLS_CERT_FILE else "plain",
+            "transport_security": TRANSPORT_SECURITY,
             "input_id": request.input_id,
             "payload_sent_kb": payload_sent_kb,
             "payload_synced_kb": payload_synced_kb,
@@ -320,7 +323,7 @@ async def sync(request: SyncRequest) -> dict[str, Any]:
         "input_id": request.input_id,
         "source": request.source,
         "security_profile": security_profile,
-        "transport_security": "tls" if TLS_CERT_FILE else "plain",
+        "transport_security": TRANSPORT_SECURITY,
         "stored_payload": "edge_reduced_clinical_summary",
         "clinical_summary": request.clinical_summary,
         "security_ms": security_timings["security_ms"],

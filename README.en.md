@@ -3,7 +3,7 @@
 This project compares two patient-monitoring pipelines:
 
 - **Cloud pipeline**: the complete patient record is sent to the cloud, and all processing is executed there.
-- **Edge pipeline**: the record is processed close to the ward/bed, a local alert is generated, and only a reduced summary is synchronized to the cloud.
+- **Edge pipeline**: the record is processed close to the ward/bed and a local alert is generated, without including cloud synchronization in the measured latency.
 
 The benchmark uses a realistic synthetic dataset of 20 patients in [data/patients.json](data/patients.json), including ward, bed, diagnosis, comorbidities, medications, and time-series vital signs.
 
@@ -97,7 +97,6 @@ benchmark client
   -> local feature extraction
   -> early-warning score
   -> local alert
-  -> reduced summary sync to cloud
   -> response to client
 ```
 
@@ -108,7 +107,7 @@ complete patient record
 complete vital-sign time series
 ```
 
-Information sent from edge to cloud:
+Information produced by the edge:
 
 ```text
 patient_id
@@ -122,7 +121,7 @@ recommended_action
 alert
 ```
 
-So the cloud no longer receives the whole raw clinical time series. It receives only the operational result needed for dashboarding, alerting, and audit.
+In the direct edge vs cloud comparison, the edge pipeline does not send data to the cloud during the measurement. The `payload_synced_kb` field is therefore `0` for edge scenarios.
 
 ## Benchmark Scenarios
 
@@ -138,7 +137,7 @@ edge_tls
 ```
 
 - `cloud`: complete cloud processing over HTTP.
-- `edge`: local edge processing over HTTP, reduced sync to cloud.
+- `edge`: local edge processing over HTTP, with no cloud sync included.
 - `*_simulated_secure`: adds simulated delay for TLS/HMAC/encryption/anti-replay.
 - `*_tls`: uses real HTTPS/mTLS with a local CA and client certificate.
 
@@ -156,6 +155,7 @@ Edge API plain:        http://localhost:8001/docs
 Cloud API TLS/mTLS:    https://localhost:8443/docs
 Edge API TLS/mTLS:     https://localhost:8444/docs
 Hospital dashboard:    http://localhost:8080
+Benchmark API:         http://localhost:8090
 Prometheus:            http://localhost:9090
 Grafana:               http://localhost:3000
 ```
@@ -183,6 +183,69 @@ results/patient_results.json
 
 `patient_results.json` feeds the hospital dashboard.
 
+## Hybrid Benchmark with Google Cloud Run
+
+To make the benchmark closer to a real deployment, you can deploy the cloud service to Google Cloud Run while keeping the edge service, Prometheus, Grafana, dashboard, and benchmark runner local.
+
+Recommended configuration:
+
+```text
+PROJECT_ID=benchmark-edge-cloud
+REGION=europe-west8
+SERVICE=benchmark-cloud-api
+```
+
+Prerequisites:
+
+```text
+gcloud installed and authenticated
+billing enabled on the Google Cloud project
+permissions for Cloud Run, Cloud Build, and Artifact Registry
+```
+
+Deploy the cloud container:
+
+```powershell
+.\scripts\deploy-cloud-run.ps1 -ProjectId benchmark-edge-cloud -Region europe-west8
+```
+
+The script:
+
+- enables the required APIs;
+- creates the Docker repository in Artifact Registry if missing;
+- builds `services/pipeline_api`;
+- deploys `benchmark-cloud-api` to Cloud Run;
+- generates `.env.gcp` and `prometheus/prometheus.gcp.yml` for the hybrid benchmark.
+
+Start the hybrid stack:
+
+```powershell
+docker compose --env-file .env.gcp -f docker-compose.yml -f docker-compose.gcp.yml up --build
+```
+
+Run the hybrid benchmark:
+
+```powershell
+docker compose --env-file .env.gcp -f docker-compose.yml -f docker-compose.gcp.yml run --rm benchmark
+```
+
+This mode runs:
+
+```text
+cloud
+edge
+cloud_simulated_secure
+edge_simulated_secure
+```
+
+The `cloud_tls` and `edge_tls` scenarios remain part of the local profile because they use mTLS terminated inside the containers. On Cloud Run, public HTTPS is terminated by the platform; for real mTLS on Google Cloud, use an Application Load Balancer with mTLS or move the deployment to GKE/Compute Engine.
+
+If the Cloud Run service is already deployed and you only need to configure the local endpoint:
+
+```powershell
+.\scripts\configure-gcp-hybrid.ps1 -CloudRunUrl https://CLOUD-RUN-URL -ProjectId benchmark-edge-cloud -Region europe-west8
+```
+
 ## Hospital Dashboard
 
 Open:
@@ -201,6 +264,29 @@ The dashboard shows:
 - recommended action;
 - cloud/edge/TLS comparison for latency, sync time, and cloud payload;
 - ward load and active alerts.
+
+The dashboard can also start the benchmark through the:
+
+```text
+Run benchmark
+```
+
+button. The button calls the `benchmark-api` service, which runs the benchmark runner in the background and updates:
+
+```text
+results/results.csv
+results/summary.json
+results/patient_results.json
+```
+
+When the status returns to `completed`, the dashboard reloads the results automatically.
+
+Control endpoints:
+
+```text
+POST http://localhost:8090/run
+GET  http://localhost:8090/status
+```
 
 ## Prometheus and Grafana
 
@@ -223,6 +309,7 @@ data/patients.json                         patient dataset
 services/pipeline_api/app/clinical.py      clinical logic
 services/pipeline_api/app/main.py          cloud/edge API
 services/benchmark/benchmark.py            benchmark runner
+services/benchmark_api/app/main.py         benchmark control API
 services/hospital_dashboard/app/main.py    hospital dashboard
 docker-compose.yml                         orchestration
 docs/cloud-edge-pipeline-benchmark-report.pdf

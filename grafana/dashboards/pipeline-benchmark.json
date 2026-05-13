@@ -52,8 +52,8 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum(rate(pipeline_total_latency_ms_bucket[1m])) by (le, pipeline))",
-          "legendFormat": "p95 {{pipeline}}",
+          "expr": "histogram_quantile(0.99, sum(rate(pipeline_total_latency_ms_bucket[1m])) by (le, pipeline))",
+          "legendFormat": "p99 {{pipeline}}",
           "refId": "A"
         },
         {
@@ -135,8 +135,8 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum(rate(pipeline_stage_latency_ms_bucket[1m])) by (le, pipeline, stage))",
-          "legendFormat": "p95 {{pipeline}} {{stage}}",
+          "expr": "histogram_quantile(0.99, sum(rate(pipeline_stage_latency_ms_bucket[1m])) by (le, pipeline, stage))",
+          "legendFormat": "p99 {{pipeline}} {{stage}}",
           "refId": "A"
         }
       ],
@@ -213,8 +213,8 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum(rate(pipeline_payload_size_kb_bucket[1m])) by (le, pipeline, kind))",
-          "legendFormat": "p95 {{pipeline}} {{kind}}",
+          "expr": "histogram_quantile(0.99, sum(rate(pipeline_payload_size_kb_bucket[1m])) by (le, pipeline, kind))",
+          "legendFormat": "p99 {{pipeline}} {{kind}}",
           "refId": "A"
         }
       ],

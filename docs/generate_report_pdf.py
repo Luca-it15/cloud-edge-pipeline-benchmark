@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
@@ -9,6 +10,7 @@ from reportlab.lib.units import mm
 from reportlab.platypus import (
     ListFlowable,
     ListItem,
+    KeepTogether,
     PageBreak,
     Paragraph,
     Preformatted,
@@ -22,6 +24,27 @@ from reportlab.platypus import (
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "docs" / "cloud-edge-pipeline-benchmark-report.pdf"
 PATIENTS = json.loads((ROOT / "data" / "patients.json").read_text(encoding="utf-8"))
+
+
+def read_env_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip()
+    return values
+
+
+GCP_ENV = read_env_file(ROOT / ".env.gcp")
+GCP_PROJECT_ID = GCP_ENV.get("GCP_PROJECT_ID", "benchmark-edge-cloud")
+GCP_REGION = GCP_ENV.get("GCP_REGION", "europe-west8")
+GCP_CLOUD_URL = GCP_ENV.get(
+    "GCP_CLOUD_URL",
+    "https://benchmark-cloud-api-x7byt6caoq-oc.a.run.app",
+)
 
 
 def code(text: str) -> str:
@@ -102,6 +125,37 @@ def make_styles():
             spaceAfter=8,
         )
     )
+    styles.add(
+        ParagraphStyle(
+            name="TableHeader",
+            parent=styles["BodyText"],
+            fontName="Helvetica-Bold",
+            fontSize=7.6,
+            leading=9.2,
+            textColor=colors.HexColor("#0b253a"),
+            wordWrap="CJK",
+        )
+    )
+    styles.add(
+        ParagraphStyle(
+            name="TableCell",
+            parent=styles["BodyText"],
+            fontName="Helvetica",
+            fontSize=7.3,
+            leading=9.0,
+            wordWrap="CJK",
+        )
+    )
+    styles.add(
+        ParagraphStyle(
+            name="TableCellSmall",
+            parent=styles["BodyText"],
+            fontName="Helvetica",
+            fontSize=6.8,
+            leading=8.2,
+            wordWrap="CJK",
+        )
+    )
     return styles
 
 
@@ -141,23 +195,31 @@ def numbered(items):
     )
 
 
-def table(data, widths):
-    tbl = Table(data, colWidths=widths, repeatRows=1, hAlign="LEFT")
+def table_cell(value, is_header: bool, small: bool):
+    if isinstance(value, Paragraph):
+        return value
+    style = S["TableHeader"] if is_header else S["TableCellSmall" if small else "TableCell"]
+    text = escape(str(value)).replace("\n", "<br/>")
+    return Paragraph(text, style)
+
+
+def table(data, widths, small: bool = False):
+    wrapped = [
+        [table_cell(cell, row_index == 0, small) for cell in row]
+        for row_index, row in enumerate(data)
+    ]
+    tbl = Table(wrapped, colWidths=widths, repeatRows=1, hAlign="LEFT", splitByRow=1)
     tbl.setStyle(
         TableStyle(
             [
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eef4f8")),
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#0b253a")),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
-                ("FONTSIZE", (0, 0), (-1, -1), 8.3),
-                ("LEADING", (0, 0), (-1, -1), 10.2),
                 ("GRID", (0, 0), (-1, -1), 0.45, colors.HexColor("#d7dee7")),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 5),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-                ("TOPPADDING", (0, 0), (-1, -1), 5),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
             ]
         )
     )
@@ -170,13 +232,13 @@ def dataset_summary_table():
         latest = patient["vitals"][-1]
         rows.append(
             [
-                f"{patient['patient_id']} - {patient['name']} ({patient['age']}{patient['sex']})",
-                f"{patient['ward']} / {patient['bed']}",
+                f"{patient['patient_id']}\n{patient['name']} ({patient['age']}{patient['sex']})",
+                f"{patient['ward']}\n{patient['bed']}",
                 patient["primary_diagnosis"],
-                f"HR {latest['heart_rate']}, SBP {latest['systolic_bp']}, RR {latest['respiratory_rate']}, SpO2 {latest['spo2']}%, T {latest['temperature']}, Glu {latest['glucose']}",
+                f"HR {latest['heart_rate']} | SBP {latest['systolic_bp']} | RR {latest['respiratory_rate']}\nSpO2 {latest['spo2']}% | T {latest['temperature']} | Glu {latest['glucose']}",
             ]
         )
-    return table(rows, [42 * mm, 36 * mm, 48 * mm, 42 * mm])
+    return table(rows, [34 * mm, 31 * mm, 50 * mm, 63 * mm], small=True)
 
 
 def build_story():
@@ -184,16 +246,25 @@ def build_story():
     story.append(Paragraph("Clinical Cloud vs Edge Pipeline Benchmark", S["Title"]))
     story.append(
         Paragraph(
-            "Detailed explanation of the patient dataset, cloud pipeline, edge pipeline, transmitted information, security modes, benchmark outputs, and hospital dashboard.",
+            "Detailed explanation of the patient dataset, local edge pipeline, Google Cloud Run deployment, transmitted information, security modes, executed benchmark pipelines, metrics, and hospital dashboard.",
             S["Subtitle"],
         )
     )
-    story.append(pre("Repository: cloud-edge-pipeline-benchmark\nDataset: data/patients.json\nDashboard: http://localhost:8080\nBenchmark: docker compose run --rm benchmark"))
+    story.append(pre(f"""
+Repository: cloud-edge-pipeline-benchmark
+Dataset: data/patients.json
+Google Cloud project: {GCP_PROJECT_ID}
+Google Cloud region: {GCP_REGION}
+Cloud Run service URL: {GCP_CLOUD_URL}
+Dashboard: http://localhost:8080
+Local benchmark: docker compose run --rm benchmark
+Hybrid GCP benchmark: see Section 11 commands
+"""))
 
     story.append(h1("1. What This Benchmark Demonstrates"))
     story.append(
         p(
-            "The project compares two ways of processing hospital monitoring data. The cloud pipeline sends the complete patient record to the cloud and performs every clinical processing step there. The edge pipeline processes the same record near the ward or bedside, creates a local early-warning alert, and sends only a reduced clinical summary to the cloud."
+            "The project compares two ways of processing hospital monitoring data. The cloud pipeline sends the complete patient record to a centralized API and performs every clinical processing step there. The edge pipeline processes the same record near the ward or bedside and creates a local early-warning alert. Cloud synchronization is not included in the measured edge latency, so the benchmark is a direct edge vs cloud comparison. The project also supports a hybrid benchmark where the cloud API is deployed on Google Cloud Run in Europe while the edge service and benchmark runner stay local."
         )
     )
     story.append(
@@ -275,7 +346,7 @@ benchmark client
     story.append(h1("4. Edge Pipeline in Detail"))
     story.append(
         p(
-            "The edge pipeline represents processing close to the source. The edge receives the same raw record, but it performs early-warning logic locally and sends only the operational result to the cloud. This reduces cloud bandwidth and limits exposure of raw clinical time-series data."
+            "The edge pipeline represents processing close to the source. The edge receives the same raw record and performs early-warning logic locally. In this benchmark, cloud synchronization is disabled for edge scenarios, so the latency reflects the local edge pipeline only."
         )
     )
     story.append(pre("""
@@ -288,7 +359,6 @@ benchmark client
   -> local feature extraction
   -> early-warning score
   -> local alert generation
-  -> reduced summary sync to cloud-api /sync
   -> response to client
 """))
     story.append(h2("Information processed locally at the edge"))
@@ -302,7 +372,7 @@ benchmark client
             ]
         )
     )
-    story.append(h2("Information sent from edge to cloud"))
+    story.append(h2("Information produced by the edge"))
     story.append(pre("""
 patient_id
 patient_hash pseudonymized from patient_id
@@ -316,13 +386,64 @@ alert
 """))
     story.append(
         p(
-            "The edge-to-cloud payload is therefore much smaller than the cloud pipeline payload. It is also less sensitive because it does not include name, medication list, comorbidity list, or the full vital-sign time series."
+            "In the direct comparison, this reduced payload is returned to the benchmark client but is not synchronized to the cloud. Therefore, edge scenarios report payload_synced_kb as 0 and sync_ms as 0."
+        )
+    )
+
+    story.append(h1("5. Google Cloud Run Deployment"))
+    story.append(
+        p(
+            "To make the benchmark closer to a real deployment, the cloud API container can be deployed on Google Cloud Run. In the current setup, the Google Cloud project is "
+            f"{code(GCP_PROJECT_ID)}, the selected European region is {code(GCP_REGION)}, and the deployed Cloud Run endpoint is {code(GCP_CLOUD_URL)}."
+        )
+    )
+    story.append(pre(f"""
+Google Cloud
+  Artifact Registry: {GCP_REGION}-docker.pkg.dev/{GCP_PROJECT_ID}/benchmark/pipeline-api:latest
+  Cloud Run service: benchmark-cloud-api
+  Public HTTPS endpoint: {GCP_CLOUD_URL}
+  Runtime role: cloud
+  Transport security label: platform_tls
+
+Local machine / simulated hospital edge
+  edge-api
+  benchmark-runner
+  prometheus
+  grafana
+  hospital-dashboard
+"""))
+    story.append(
+        p(
+            "Cloud Run terminates public HTTPS at the Google-managed platform boundary. For this reason, the hybrid Google Cloud Run scenarios are labelled "
+            f"{code('platform_tls')} rather than container-terminated mTLS. The local {code('cloud_tls')} and {code('edge_tls')} scenarios still use the repository's local mTLS certificates and remain useful for measuring container-level TLS overhead."
+        )
+    )
+    story.append(h2("Hybrid Google Cloud execution path"))
+    story.append(pre("""
+benchmark-runner local
+  -> HTTPS request to Google Cloud Run /process for cloud scenarios
+
+benchmark-runner local
+  -> local edge-api /process for edge scenarios
+
+prometheus local
+  -> scrapes local edge-api /metrics
+  -> scrapes Google Cloud Run /metrics over HTTPS
+"""))
+    story.append(
+        bullets(
+            [
+                "The cloud path includes real internet routing from the local machine to Google Cloud Run.",
+                "The edge path keeps clinical preprocessing and risk scoring local and does not include cloud synchronization in the measured latency.",
+                "Prometheus observes both local edge metrics and remote cloud metrics, while Grafana visualizes the collected time series.",
+                "The hospital dashboard continues to read benchmark result files from the local results directory.",
+            ]
         )
     )
 
     story.append(PageBreak())
 
-    story.append(h1("5. Clinical Processing Logic"))
+    story.append(h1("6. Clinical Processing Logic"))
     story.append(p(f"The processing logic is implemented in {code('services/pipeline_api/app/clinical.py')}."))
     logic_rows = [
         ["Step", "Cloud", "Edge"],
@@ -332,9 +453,9 @@ alert
         ["Feature extraction", "Computes latest values, averages, and trends from the full time series.", "Computes latest values, averages, and trends from filtered vitals."],
         ["Risk scoring", "Vital score + trend score + clinical context score.", "Same scoring logic on filtered local features."],
         ["Alerting", "Cloud triage alert after central processing.", "Immediate local alert before cloud synchronization."],
-        ["Storage/sync", "Stores full clinical payload.", "Syncs reduced summary only."],
+        ["Storage/sync", "Stores full clinical payload.", "No cloud sync in the measured edge pipeline."],
     ]
-    story.append(table(logic_rows, [36 * mm, 66 * mm, 66 * mm]))
+    story.append(table(logic_rows, [32 * mm, 73 * mm, 73 * mm]))
 
     story.append(h2("Risk score components"))
     story.append(
@@ -348,7 +469,7 @@ alert
         )
     )
 
-    story.append(h1("6. Benchmark Scenarios"))
+    story.append(h1("7. Executed Benchmark Pipelines"))
     story.append(pre("""
 cloud
 edge
@@ -359,23 +480,46 @@ edge_tls
 """))
     story.append(
         p(
-            "For every patient, the benchmark runner sends the record to all six scenarios. The simulated secure scenarios add configurable synthetic security costs. The TLS scenarios use real HTTPS/mTLS using local certificates generated by the certgen service."
+            "The benchmark compares the user-facing /process pipeline for cloud and edge. Edge scenarios do not call the cloud /sync endpoint during measurement, so the comparison is direct."
         )
     )
-    scenario_rows = [
+    story.append(h2("Local Docker benchmark scenarios"))
+    local_scenario_rows = [
         ["Scenario", "Processing", "Transport", "Purpose"],
         ["cloud", "Full central processing", "HTTP", "Baseline centralized pipeline."],
-        ["edge", "Local scoring and reduced sync", "HTTP", "Baseline edge pipeline."],
+        ["edge", "Local scoring", "HTTP", "Baseline edge pipeline without cloud sync."],
         ["cloud_simulated_secure", "Full central processing", "HTTP + simulated security stages", "Explain theoretical security overhead."],
-        ["edge_simulated_secure", "Local scoring and reduced sync", "HTTP + simulated security stages", "Explain security overhead on edge and sync."],
+        ["edge_simulated_secure", "Local scoring", "HTTP + simulated security stages", "Explain edge-side security overhead."],
         ["cloud_tls", "Full central processing", "HTTPS/mTLS", "Measure real transport security overhead."],
-        ["edge_tls", "Local scoring and reduced sync", "HTTPS/mTLS", "Measure TLS on client-edge and edge-cloud sync."],
+        ["edge_tls", "Local scoring", "HTTPS/mTLS", "Measure TLS on the client-edge request."],
     ]
-    story.append(table(scenario_rows, [38 * mm, 48 * mm, 38 * mm, 44 * mm]))
+    story.append(table(local_scenario_rows, [34 * mm, 49 * mm, 43 * mm, 52 * mm], small=True))
+
+    gcp_scenario_rows = [
+        ["Scenario", "Cloud target", "Edge target", "What is measured"],
+        ["cloud", "Google Cloud Run /process", "Not used", "Real client-to-Google-Cloud latency plus cloud processing."],
+        ["edge", "Not used", "Local edge-api /process", "Local edge processing without cloud synchronization."],
+        ["cloud_simulated_secure", "Google Cloud Run /process", "Not used", "Google Cloud path plus simulated auth/crypto/replay costs."],
+        ["edge_simulated_secure", "Not used", "Local edge-api /process", "Local edge path plus simulated security costs."],
+    ]
+    story.append(
+        KeepTogether(
+            [
+                h2("Hybrid Google Cloud Run scenarios"),
+                table(gcp_scenario_rows, [35 * mm, 45 * mm, 38 * mm, 60 * mm], small=True),
+            ]
+        )
+    )
+
+    story.append(
+        p(
+            f"In hybrid mode, {code('BENCHMARK_SCENARIOS')} is set to {code('cloud,edge,cloud_simulated_secure,edge_simulated_secure')} because Cloud Run provides platform HTTPS but does not terminate the repository's local mTLS certificates inside the container. The local TLS scenarios remain available in the standard Docker Compose benchmark."
+        )
+    )
 
     story.append(PageBreak())
 
-    story.append(h1("7. Benchmark Outputs"))
+    story.append(h1("8. Benchmark Outputs"))
     story.append(pre("""
 results/results.csv
 results/summary.json
@@ -395,15 +539,15 @@ results/patient_results.json
         ["network_ms", "Configured network delay stage."],
         ["preprocess_ms", "Validation, cleaning, filtering, and feature preparation stage."],
         ["inference_ms", "Clinical risk scoring stage."],
-        ["sync_ms", "Edge-to-cloud synchronization time."],
+        ["sync_ms", "Cloud synchronization time. It is 0 for edge scenarios in the direct comparison."],
         ["payload_sent_kb", "Input payload sent by the benchmark client."],
-        ["payload_synced_kb", "Payload sent to cloud. Full record in cloud mode, reduced summary in edge mode."],
+        ["payload_synced_kb", "Payload sent to cloud. Full record in cloud mode, 0 in edge mode."],
         ["risk_score, risk_level", "Computed patient risk."],
         ["recommended_action", "Operational recommendation for the ward team."],
     ]
-    story.append(table(csv_rows, [50 * mm, 118 * mm]))
+    story.append(table(csv_rows, [43 * mm, 135 * mm]))
 
-    story.append(h1("8. Hospital Dashboard"))
+    story.append(h1("9. Hospital Dashboard"))
     story.append(p(f"The hospital dashboard is served by {code('services/hospital_dashboard/app/main.py')} at {code('http://localhost:8080')}."))
     story.append(
         bullets(
@@ -412,7 +556,7 @@ results/patient_results.json
                 "Ward and risk filters.",
                 "Latest vital signs for the selected patient.",
                 "Diagnosis, medications, comorbidities, risk score, and recommended action.",
-                "Per-patient comparison of cloud, edge, simulated security, and TLS scenarios.",
+                "Per-patient comparison of cloud, edge, simulated security, TLS, and Google Cloud hybrid scenarios when the corresponding benchmark run has been executed.",
                 "Ward load and active alert count.",
             ]
         )
@@ -423,7 +567,7 @@ results/patient_results.json
         )
     )
 
-    story.append(h1("9. Prometheus and Grafana"))
+    story.append(h1("10. Prometheus and Grafana"))
     story.append(
         p(
             "Prometheus collects runtime metrics from the API services. It does not execute the benchmark. Grafana visualizes those metrics over time. The hospital dashboard is separate: it visualizes clinical benchmark results."
@@ -436,17 +580,36 @@ pipeline_stage_latency_ms
 pipeline_payload_size_kb
 pipeline_in_flight_requests
 """))
+    story.append(
+        p(
+            "In the local benchmark, Prometheus scrapes Docker service names such as cloud-api, edge-api, cloud-api-tls, and edge-api-tls. In the Google Cloud hybrid benchmark, Prometheus uses prometheus.gcp.yml to scrape the local edge-api and the Cloud Run HTTPS host generated in .env.gcp."
+        )
+    )
 
-    story.append(h1("10. Commands"))
+    story.append(h1("11. Commands"))
     story.append(pre("""
 docker compose up --build
 docker compose run --rm benchmark
+
+powershell -ExecutionPolicy Bypass -File scripts\\deploy-cloud-run.ps1 `
+  -ProjectId benchmark-edge-cloud `
+  -Region europe-west8
+
+docker compose --env-file .env.gcp `
+  -f docker-compose.yml `
+  -f docker-compose.gcp.yml up --build
+
+docker compose --env-file .env.gcp `
+  -f docker-compose.yml `
+  -f docker-compose.gcp.yml run --rm benchmark
+
 docker compose ps
-docker compose logs -f cloud-api edge-api cloud-api-tls edge-api-tls hospital-dashboard
+docker compose logs -f cloud-api edge-api cloud-api-tls `
+  edge-api-tls hospital-dashboard
 docker compose down
 """))
 
-    story.append(h1("11. Limitations"))
+    story.append(h1("12. Limitations"))
     story.append(
         bullets(
             [
@@ -454,6 +617,8 @@ docker compose down
                 "The scoring model is deterministic and explanatory; it is not a validated medical model.",
                 "The edge is emulated through Docker CPU/RAM limits, not real bedside hardware.",
                 "TLS certificates are local self-signed certificates for benchmarking, not production certificates.",
+                "Cloud Run platform HTTPS is real, but it is terminated by Google Cloud rather than by the application container.",
+                "The hybrid Google Cloud benchmark depends on the local network path from the workstation to Google Cloud Europe.",
                 "Network delay is simulated at application level; a stronger network study could use tc netem, Mininet, or Containernet.",
             ]
         )

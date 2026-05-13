@@ -3,14 +3,16 @@ import os
 from pathlib import Path
 from typing import Any
 
+import httpx
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 
 
 DATASET_PATH = Path(os.getenv("DATASET_PATH", "/app/data/patients.json"))
 RESULTS_PATH = Path(os.getenv("RESULTS_PATH", "/app/results/patient_results.json"))
 PORT = int(os.getenv("PORT", "8080"))
+BENCHMARK_API_URL = os.getenv("BENCHMARK_API_URL", "http://benchmark-api:8090").rstrip("/")
 
 
 app = FastAPI(title="Hospital Operations Dashboard", version="1.0.0")
@@ -154,6 +156,32 @@ async def patient_results() -> dict[str, Any]:
     return base_payload()
 
 
+@app.get("/api/benchmark/status")
+async def benchmark_status() -> dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            response = await client.get(f"{BENCHMARK_API_URL}/status")
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Benchmark API unavailable: {exc}") from exc
+
+
+@app.post("/api/benchmark/run")
+async def benchmark_run() -> dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(f"{BENCHMARK_API_URL}/run", json={})
+            if response.status_code == 409:
+                raise HTTPException(status_code=409, detail="Benchmark is already running")
+            response.raise_for_status()
+            return response.json()
+    except HTTPException:
+        raise
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Benchmark API unavailable: {exc}") from exc
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
     return DASHBOARD_HTML
@@ -247,6 +275,30 @@ DASHBOARD_HTML = r"""
       cursor: pointer;
       font-weight: 700;
     }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.62;
+    }
+
+    .status-pill {
+      min-height: 36px;
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 0 12px;
+      background: #fbfcfe;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 760;
+      text-transform: uppercase;
+    }
+
+    .status-pill.running { color: var(--accent); border-color: #9bc8d9; background: #eef7fb; }
+    .status-pill.completed { color: var(--low); border-color: #a8d7ba; background: #effaf3; }
+    .status-pill.failed { color: var(--critical); border-color: #e3aaa5; background: #fff2f0; }
+    .status-pill.unavailable { color: var(--high); border-color: #efc69c; background: #fff7ed; }
 
     main {
       padding: 18px 0 26px;
@@ -502,6 +554,8 @@ DASHBOARD_HTML = r"""
           <option value="pending">Pending</option>
         </select>
         <input id="searchBox" type="search" placeholder="Search patient, bed, diagnosis">
+        <button id="runBenchmarkButton">Run benchmark</button>
+        <span class="status-pill" id="benchmarkStatus">Idle</span>
         <button id="refreshButton">Refresh</button>
       </div>
     </div>
@@ -558,7 +612,9 @@ DASHBOARD_HTML = r"""
 
   <script>
     let state = { patients: [], ward_counts: {}, risk_counts: {}, summary: {}, scenarios: [] };
+    let benchmarkState = { status: "idle", running: false };
     let selectedPatientId = null;
+    let statusPoll = null;
 
     const riskOrder = { critical: 0, high: 1, medium: 2, low: 3, pending: 4 };
 
@@ -597,7 +653,7 @@ DASHBOARD_HTML = r"""
         <div class="comparison-item">
           <div class="name">${name}</div>
           <div class="mono">latency: ${fmtMs(data.client_total_ms)}</div>
-          <div class="mono">sync: ${fmtMs(data.sync_ms)}</div>
+          <div class="mono">cloud sync: ${fmtMs(data.sync_ms)}</div>
           <div class="mono">cloud payload: ${fmtKb(data.payload_synced_kb)}</div>
         </div>
       `).join("")}</div></div>`;
@@ -712,11 +768,79 @@ DASHBOARD_HTML = r"""
       render();
     }
 
+    function renderBenchmarkStatus() {
+      const pill = document.getElementById("benchmarkStatus");
+      const button = document.getElementById("runBenchmarkButton");
+      const status = benchmarkState.status || "idle";
+      pill.textContent = status;
+      pill.className = `status-pill ${status}`;
+      button.disabled = status === "running";
+    }
+
+    function startStatusPolling() {
+      if (statusPoll) return;
+      statusPoll = window.setInterval(loadBenchmarkStatus, 2500);
+    }
+
+    function stopStatusPolling() {
+      if (!statusPoll) return;
+      window.clearInterval(statusPoll);
+      statusPoll = null;
+    }
+
+    async function loadBenchmarkStatus() {
+      try {
+        const previousStatus = benchmarkState.status;
+        const response = await fetch("/api/benchmark/status", { cache: "no-store" });
+        benchmarkState = await response.json();
+        renderBenchmarkStatus();
+        if (benchmarkState.running) {
+          startStatusPolling();
+          return;
+        }
+        stopStatusPolling();
+        if (previousStatus === "running" && benchmarkState.status === "completed") {
+          await loadData();
+        }
+      } catch (error) {
+        benchmarkState = { status: "unavailable", running: false };
+        renderBenchmarkStatus();
+        stopStatusPolling();
+      }
+    }
+
+    async function runBenchmark() {
+      const button = document.getElementById("runBenchmarkButton");
+      button.disabled = true;
+      try {
+        const response = await fetch("/api/benchmark/run", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        });
+        if (response.status === 409) {
+          await loadBenchmarkStatus();
+          return;
+        }
+        if (!response.ok) {
+          throw new Error(`Run failed: ${response.status}`);
+        }
+        benchmarkState = await response.json().catch(() => ({ status: "running", running: true }));
+        renderBenchmarkStatus();
+        startStatusPolling();
+      } catch (error) {
+        benchmarkState = { status: "failed", running: false };
+        renderBenchmarkStatus();
+      }
+    }
+
     document.getElementById("wardFilter").addEventListener("change", render);
     document.getElementById("riskFilter").addEventListener("change", render);
     document.getElementById("searchBox").addEventListener("input", render);
     document.getElementById("refreshButton").addEventListener("click", loadData);
+    document.getElementById("runBenchmarkButton").addEventListener("click", runBenchmark);
     loadData();
+    loadBenchmarkStatus();
   </script>
 </body>
 </html>

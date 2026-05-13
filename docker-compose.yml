@@ -80,7 +80,7 @@ services:
       ROLE: edge
       SERVICE_NAME: edge-api
       PORT: 8000
-      CLOUD_SYNC_URL: http://cloud-api:8000/sync
+      CLOUD_SYNC_URL: ""
       NETWORK_UPLINK_MS: 8
       PREPROCESS_MS: 42
       INFERENCE_MS: 76
@@ -95,9 +95,6 @@ services:
       - "8001:8000"
     cpus: "1.0"
     mem_limit: 512m
-    depends_on:
-      cloud-api:
-        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2).read()"]
       interval: 5s
@@ -112,7 +109,7 @@ services:
       ROLE: edge
       SERVICE_NAME: edge-api-tls
       PORT: 8443
-      CLOUD_SYNC_URL: https://cloud-api-tls:8443/sync
+      CLOUD_SYNC_URL: ""
       NETWORK_UPLINK_MS: 8
       PREPROCESS_MS: 42
       INFERENCE_MS: 76
@@ -136,8 +133,8 @@ services:
     volumes:
       - ./certs:/certs:ro
     depends_on:
-      cloud-api-tls:
-        condition: service_healthy
+      certgen:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "python", "-m", "app.healthcheck", "https://localhost:8443/health"]
       interval: 5s
@@ -163,10 +160,47 @@ services:
       COMPLEXITY: 1.0
       OUTPUT_DIR: /app/results
       REQUEST_TIMEOUT_SECONDS: 30
+      BENCHMARK_SCENARIOS: cloud,edge,cloud_simulated_secure,edge_simulated_secure,cloud_tls,edge_tls
     volumes:
       - ./results:/app/results
       - ./certs:/certs:ro
       - ./data:/app/data:ro
+    depends_on:
+      cloud-api:
+        condition: service_healthy
+      edge-api:
+        condition: service_healthy
+      cloud-api-tls:
+        condition: service_healthy
+      edge-api-tls:
+        condition: service_healthy
+
+  benchmark-api:
+    build:
+      context: ./services
+      dockerfile: benchmark_api/Dockerfile
+    container_name: benchmark-control-api
+    environment:
+      PORT: 8090
+      CLOUD_URL: http://cloud-api:8000/process
+      EDGE_URL: http://edge-api:8000/process
+      CLOUD_TLS_URL: https://cloud-api-tls:8443/process
+      EDGE_TLS_URL: https://edge-api-tls:8443/process
+      TLS_CA_FILE: /certs/ca.crt
+      TLS_CLIENT_CERT_FILE: /certs/client.crt
+      TLS_CLIENT_KEY_FILE: /certs/client.key
+      DATASET_PATH: /app/data/patients.json
+      DATASET_REPEATS: 1
+      COMPLEXITY: 1.0
+      OUTPUT_DIR: /app/results
+      REQUEST_TIMEOUT_SECONDS: 30
+      BENCHMARK_SCENARIOS: cloud,edge,cloud_simulated_secure,edge_simulated_secure,cloud_tls,edge_tls
+    volumes:
+      - ./results:/app/results
+      - ./certs:/certs:ro
+      - ./data:/app/data:ro
+    ports:
+      - "8090:8090"
     depends_on:
       cloud-api:
         condition: service_healthy
@@ -184,12 +218,15 @@ services:
     environment:
       DATASET_PATH: /app/data/patients.json
       RESULTS_PATH: /app/results/patient_results.json
+      BENCHMARK_API_URL: http://benchmark-api:8090
       PORT: 8080
     volumes:
       - ./data:/app/data:ro
       - ./results:/app/results:ro
     ports:
       - "8080:8080"
+    depends_on:
+      - benchmark-api
 
   prometheus:
     image: prom/prometheus:v2.55.1

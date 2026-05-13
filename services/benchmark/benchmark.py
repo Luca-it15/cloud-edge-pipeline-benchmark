@@ -23,6 +23,10 @@ DATASET_REPEATS = int(os.getenv("DATASET_REPEATS", "1"))
 COMPLEXITY = float(os.getenv("COMPLEXITY", "1.0"))
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "/app/results"))
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
+BENCHMARK_SCENARIOS = os.getenv(
+    "BENCHMARK_SCENARIOS",
+    "cloud,edge,cloud_simulated_secure,edge_simulated_secure,cloud_tls,edge_tls",
+)
 
 
 FIELDS = [
@@ -266,21 +270,35 @@ async def main() -> None:
     patients = load_patients()
     rows: list[dict[str, Any]] = []
 
-    targets = [
-        ("cloud", CLOUD_URL, "cloud", "none"),
-        ("edge", EDGE_URL, "edge", "none"),
-        ("cloud_sim", CLOUD_URL, "cloud", "simulated"),
-        ("edge_sim", EDGE_URL, "edge", "simulated"),
-        ("cloud_tls", CLOUD_TLS_URL, "cloud", "tls"),
-        ("edge_tls", EDGE_TLS_URL, "edge", "tls"),
+    scenario_definitions = {
+        "cloud": (CLOUD_URL, "cloud", "none"),
+        "edge": (EDGE_URL, "edge", "none"),
+        "cloud_simulated_secure": (CLOUD_URL, "cloud", "simulated"),
+        "edge_simulated_secure": (EDGE_URL, "edge", "simulated"),
+        "cloud_tls": (CLOUD_TLS_URL, "cloud", "tls"),
+        "edge_tls": (EDGE_TLS_URL, "edge", "tls"),
+    }
+    requested_scenarios = [
+        scenario.strip()
+        for scenario in BENCHMARK_SCENARIOS.split(",")
+        if scenario.strip()
     ]
+    unknown_scenarios = [
+        scenario
+        for scenario in requested_scenarios
+        if scenario not in scenario_definitions
+    ]
+    if unknown_scenarios:
+        known = ", ".join(sorted(scenario_definitions))
+        raise ValueError(f"Unknown benchmark scenarios: {unknown_scenarios}. Known scenarios: {known}")
+    targets = [scenario_definitions[scenario] for scenario in requested_scenarios]
 
     run_id = 0
     for repeat in range(1, DATASET_REPEATS + 1):
         for patient in patients:
             run_id += 1
             run_rows = []
-            for _, url, pipeline, security_profile in targets:
+            for url, pipeline, security_profile in targets:
                 row = await run_one(url, pipeline, security_profile, run_id, patient)
                 run_rows.append(row)
                 rows.append(row)

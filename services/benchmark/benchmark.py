@@ -41,12 +41,13 @@ FIELDS = [
     "ward",
     "bed",
     "diagnosis",
+    "initial_risk_score",
+    "initial_risk_level",
     "client_total_ms",
     "service_total_ms",
     "client_service_delta_ms",
     "security_profile",
     "transport_security",
-    "cold_start_candidate",
     "process_age_ms",
     "network_ms",
     "security_ms",
@@ -72,12 +73,56 @@ FIELDS = [
 ]
 
 
+VITAL_RANGES = {
+    "heart_rate": (50.0, 110.0, "bpm"),
+    "systolic_bp": (90.0, 160.0, "mmHg"),
+    "respiratory_rate": (10.0, 24.0, "/min"),
+    "spo2": (94.0, 100.0, "%"),
+    "temperature": (35.8, 38.0, "C"),
+    "glucose": (70.0, 180.0, "mg/dL"),
+}
+
+
 def patient_hash(patient_id: str) -> str:
     return hashlib.sha256(patient_id.encode("utf-8")).hexdigest()[:12]
 
 
 def log_event(event: str, **fields: Any) -> None:
     print(json.dumps({"event": event, **fields}, separators=(",", ":"), sort_keys=True, default=str), flush=True)
+
+
+def initial_risk_assessment(patient: dict[str, Any]) -> dict[str, Any]:
+    latest = patient["vitals"][-1]
+    findings = []
+    for key, (low, high, unit) in VITAL_RANGES.items():
+        value = float(latest[key])
+        if value < low or value > high:
+            findings.append(
+                {
+                    "vital": key,
+                    "value": value,
+                    "unit": unit,
+                    "normal_min": low,
+                    "normal_max": high,
+                    "direction": "low" if value < low else "high",
+                }
+            )
+
+    if any(item["vital"] == "spo2" and item["value"] < 90 for item in findings):
+        score, level = 10, "critical"
+    elif len(findings) >= 3:
+        score, level = 8, "high"
+    elif findings:
+        score, level = 4, "medium"
+    else:
+        score, level = 0, "low"
+
+    return {
+        "source": "benchmark_initial_screening",
+        "risk_score": score,
+        "risk_level": level,
+        "abnormal_vitals": findings,
+    }
 
 
 def percentile(values: list[float], pct: float) -> float:
@@ -108,7 +153,6 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "mean_client_service_delta_ms": statistics.fmean(
                 float(row["client_service_delta_ms"]) for row in subset
             ),
-            "cold_start_requests": sum(1 for row in subset if row["cold_start_candidate"] == "true"),
             "mean_preprocess_ms": statistics.fmean(float(row["preprocess_ms"]) for row in subset),
             "mean_inference_ms": statistics.fmean(float(row["inference_ms"]) for row in subset),
             "mean_storage_ms": statistics.fmean(float(row["storage_ms"]) for row in subset),
@@ -145,11 +189,13 @@ async def run_one(
 ) -> dict[str, Any]:
     suffix = security_profile if security_profile != "none" else "plain"
     input_id = f"{pipeline}-{suffix}-r{repeat}-{patient['patient_id']}-{run_id:04d}"
+    initial_risk = initial_risk_assessment(patient)
     payload = {
         "input_id": input_id,
         "complexity": COMPLEXITY,
         "security_profile": security_profile,
         "patient_record": patient,
+        "initial_risk_assessment": initial_risk,
     }
 
     log_event(
@@ -163,6 +209,8 @@ async def run_one(
         ward=patient["ward"],
         bed=patient["bed"],
         diagnosis=patient["primary_diagnosis"],
+        initial_risk_score=initial_risk["risk_score"],
+        initial_risk_level=initial_risk["risk_level"],
         vital_samples=len(patient.get("vitals", [])),
         endpoint=url,
     )
@@ -181,6 +229,7 @@ async def run_one(
     clinical = body["clinical"]
     risk = clinical["risk"] or {}
     abnormal_vitals = risk.get("abnormal_vitals", [])
+    response_initial_risk = body.get("initial_risk_assessment") or initial_risk
 
     row = {
         "pipeline": body["pipeline"],
@@ -192,12 +241,13 @@ async def run_one(
         "ward": patient["ward"],
         "bed": patient["bed"],
         "diagnosis": patient["primary_diagnosis"],
+        "initial_risk_score": response_initial_risk.get("risk_score", initial_risk["risk_score"]),
+        "initial_risk_level": response_initial_risk.get("risk_level", initial_risk["risk_level"]),
         "client_total_ms": round(client_total_ms, 3),
         "service_total_ms": round(service_total_ms, 3),
         "client_service_delta_ms": round(client_total_ms - service_total_ms, 3),
         "security_profile": body["security_profile"],
         "transport_security": body.get("transport_security", "plain"),
-        "cold_start_candidate": "true" if body.get("cold_start_candidate") else "false",
         "process_age_ms": round(float(body.get("process_age_ms", 0.0)), 3),
         "network_ms": round(float(timings.get("network_ms", 0.0)), 3),
         "security_ms": round(float(timings.get("security_ms", 0.0)), 3),
@@ -235,7 +285,6 @@ async def run_one(
         alert=row["alert"] == "true",
         client_total_ms=row["client_total_ms"],
         service_total_ms=row["service_total_ms"],
-        cold_start_candidate=row["cold_start_candidate"] == "true",
         process_age_ms=row["process_age_ms"],
         payload_sent_kb=row["payload_sent_kb"],
         payload_synced_kb=row["payload_synced_kb"],
@@ -263,7 +312,8 @@ def dashboard_payload(rows: list[dict[str, Any]], patients: list[dict[str, Any]]
             "service_total_ms": row["service_total_ms"],
             "transport_security": row["transport_security"],
             "payload_sent_kb": row["payload_sent_kb"],
-            "cold_start_candidate": row["cold_start_candidate"],
+            "initial_risk_score": row["initial_risk_score"],
+            "initial_risk_level": row["initial_risk_level"],
             "risk_score": row["risk_score"],
             "risk_level": row["risk_level"],
             "alert": row["alert"] == "true",
@@ -289,6 +339,8 @@ def dashboard_payload(rows: list[dict[str, Any]], patients: list[dict[str, Any]]
                 "comorbidities": patient.get("comorbidities", []),
                 "medications": patient.get("medications", []),
                 "latest_vitals": latest_vitals,
+                "initial_risk_score": row["initial_risk_score"],
+                "initial_risk_level": row["initial_risk_level"],
                 "risk_score": row["risk_score"],
                 "risk_level": row["risk_level"],
                 "recommended_action": row["recommended_action"],

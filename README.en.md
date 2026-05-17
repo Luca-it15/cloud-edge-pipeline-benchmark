@@ -194,7 +194,7 @@ Deploy the cloud container:
 .\scripts\deploy-cloud-run.ps1 -ProjectId benchmark-edge-cloud -Region europe-west8
 ```
 
-The script uses `-MinInstances 1` by default to keep Cloud Run warm during the benchmark and make the edge/cloud comparison more stable. To measure cold start, use:
+The script uses `-MinInstances 1` by default to keep Cloud Run warm during the benchmark and make the edge/cloud comparison more stable. For separate experiments on real Cloud Run cold starts, use:
 
 ```powershell
 .\scripts\deploy-cloud-run.ps1 -ProjectId benchmark-edge-cloud -Region europe-west8 -MinInstances 0
@@ -300,10 +300,9 @@ pipeline_stage_latency_ms
 pipeline_payload_size_kb
 pipeline_in_flight_requests
 pipeline_process_started_at_seconds
-pipeline_cold_start_requests_total
 ```
 
-Grafana visualizes these metrics over time. By default, Prometheus scrapes only the local edge, so it does not wake Cloud Run before the benchmark and does not distort cold-start measurement.
+Grafana visualizes these metrics over time. By default, Prometheus scrapes only the local edge, so monitoring traffic stays separate from benchmark traffic.
 
 The cloud pipeline still exposes `/metrics` on Cloud Run. If you explicitly want Prometheus to observe cloud application metrics too, use the generated file:
 
@@ -317,7 +316,7 @@ Start with cloud scraping enabled:
 docker compose --env-file .env.gcp -f docker-compose.yml -f docker-compose.cloud-metrics.yml up --build
 ```
 
-Note: a Prometheus scrape against Cloud Run is a real HTTP request, so it can cold-start an instance or keep it warm. To measure cold start, do not enable cloud scraping before running the benchmark. For cloud infrastructure metrics without disturbing application traffic, use Google Cloud Monitoring.
+Note: a Prometheus scrape against Cloud Run is a real HTTP request, so it can cold-start an instance or keep it warm. The application benchmark no longer exposes a cold-start counter because a local "first request in process" flag does not represent the service's real infrastructure startup. For cloud infrastructure metrics without disturbing application traffic, use Google Cloud Monitoring.
 
 ## Pipeline Logs
 
@@ -333,9 +332,7 @@ cloud_storage
 dashboard_response
 ```
 
-The logs include the pseudonymized patient hash, ward, bed, diagnosis, vital-sample count, clinical fields used, sent payload, computed risk, and per-step timings. Patient names and raw vital-sign values are not printed.
-
-The first `/process` handled by each instance is marked with `cold_start_candidate=true` and increments `pipeline_cold_start_requests_total`. If Cloud Run is configured with `min-instances=0` and is not woken by Prometheus or other requests, the first cloud sample in the benchmark includes cold-start latency.
+The logs include the pseudonymized patient hash, ward, bed, diagnosis, vital-sample count, clinical fields used, sent payload, computed risk, process age, and per-step timings. Patient names and raw vital-sign values are not printed.
 
 The local edge is configured as `ward-gateway-0.5vcpu-256mb` with:
 

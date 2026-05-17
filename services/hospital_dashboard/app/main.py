@@ -24,91 +24,15 @@ def read_json(path: Path, fallback: Any) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def classify(score: int) -> str:
-    if score >= 10:
-        return "critical"
-    if score >= 6:
-        return "high"
-    if score >= 3:
-        return "medium"
-    return "low"
-
-
-def action(level: str) -> str:
-    return {
-        "critical": "Immediate physician review and continuous monitoring",
-        "high": "Nurse escalation and repeat vitals within 15 minutes",
-        "medium": "Repeat vitals within 30 minutes and review treatment plan",
-        "low": "Routine monitoring",
-    }[level]
-
-
-def quick_score(patient: dict[str, Any]) -> int:
-    latest = patient["vitals"][-1]
-    first = patient["vitals"][0]
-    score = 0
-    if latest["heart_rate"] >= 130 or latest["heart_rate"] <= 40:
-        score += 3
-    elif latest["heart_rate"] >= 110 or latest["heart_rate"] <= 50:
-        score += 2
-    elif latest["heart_rate"] >= 95:
-        score += 1
-    if latest["systolic_bp"] <= 90:
-        score += 3
-    elif latest["systolic_bp"] <= 100:
-        score += 2
-    elif latest["systolic_bp"] <= 110 or latest["systolic_bp"] >= 180:
-        score += 1
-    if latest["respiratory_rate"] >= 30 or latest["respiratory_rate"] <= 8:
-        score += 3
-    elif latest["respiratory_rate"] >= 25:
-        score += 2
-    elif latest["respiratory_rate"] >= 21:
-        score += 1
-    if latest["spo2"] <= 90:
-        score += 3
-    elif latest["spo2"] <= 93:
-        score += 2
-    elif latest["spo2"] <= 95:
-        score += 1
-    if latest["temperature"] >= 39 or latest["temperature"] <= 35:
-        score += 2
-    elif latest["temperature"] >= 38 or latest["temperature"] < 36:
-        score += 1
-    if latest["glucose"] >= 250 or latest["glucose"] <= 60:
-        score += 2
-    elif latest["glucose"] >= 180:
-        score += 1
-    if latest["heart_rate"] - first["heart_rate"] >= 12:
-        score += 1
-    if latest["respiratory_rate"] - first["respiratory_rate"] >= 4:
-        score += 1
-    if latest["spo2"] - first["spo2"] <= -3:
-        score += 1
-    if latest["systolic_bp"] - first["systolic_bp"] <= -12:
-        score += 1
-    if patient["age"] >= 75:
-        score += 1
-    if len(patient.get("comorbidities", [])) >= 3:
-        score += 1
-    return score
-
-
 def base_payload() -> dict[str, Any]:
     patients = read_json(DATASET_PATH, [])
     patient_payload = []
-    risk_counts: dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    risk_counts: dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0, "pending": len(patients)}
     ward_counts: dict[str, dict[str, int]] = {}
 
     for patient in patients:
-        score = quick_score(patient)
-        level = classify(score)
-        is_alert = level in {"critical", "high"}
-        risk_counts[level] = risk_counts.get(level, 0) + 1
         ward_counts.setdefault(patient["ward"], {"patients": 0, "alerts": 0})
         ward_counts[patient["ward"]]["patients"] += 1
-        if is_alert:
-            ward_counts[patient["ward"]]["alerts"] += 1
         patient_payload.append(
             {
                 "patient_id": patient["patient_id"],
@@ -121,11 +45,13 @@ def base_payload() -> dict[str, Any]:
                 "comorbidities": patient.get("comorbidities", []),
                 "medications": patient.get("medications", []),
                 "latest_vitals": patient["vitals"][-1],
-                "risk_score": score,
-                "risk_level": level,
-                "recommended_action": action(level),
+                "initial_risk_score": None,
+                "initial_risk_level": "pending",
+                "risk_score": None,
+                "risk_level": "pending",
+                "recommended_action": "Waiting for pipeline response",
                 "abnormal_vitals": [],
-                "alert": is_alert,
+                "alert": False,
                 "pipeline_comparison": {},
             }
         )
@@ -139,7 +65,7 @@ def base_payload() -> dict[str, Any]:
         "ward_counts": ward_counts,
         "patients": sorted(
             patient_payload,
-            key=lambda item: ({"critical": 0, "high": 1, "medium": 2, "low": 3}.get(item["risk_level"], 9), item["ward"]),
+            key=lambda item: (item["ward"], item["bed"], item["name"]),
         ),
         "results": [],
     }
@@ -151,7 +77,9 @@ async def health() -> dict[str, str]:
 
 
 @app.get("/api/patient-results")
-async def patient_results() -> dict[str, Any]:
+async def patient_results(pending: bool = False) -> dict[str, Any]:
+    if pending:
+        return base_payload()
     if RESULTS_PATH.exists():
         return read_json(RESULTS_PATH, {})
     return base_payload()
@@ -331,6 +259,28 @@ DASHBOARD_HTML = r"""
       margin-top: 8px;
       font-size: 28px;
       font-weight: 780;
+    }
+
+    .latency-panel {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      margin-bottom: 16px;
+      overflow: hidden;
+    }
+
+    .latency-table th,
+    .latency-table td {
+      padding: 9px 12px;
+    }
+
+    .latency-name {
+      font-weight: 780;
+    }
+
+    .latency-empty {
+      padding: 14px;
+      color: var(--muted);
     }
 
     .layout {
@@ -522,6 +472,79 @@ DASHBOARD_HTML = r"""
       font-size: 12px;
     }
 
+    .critical-dialog-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 20;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 18px;
+      background: rgba(15, 23, 42, 0.52);
+    }
+
+    .critical-dialog-backdrop.open {
+      display: flex;
+    }
+
+    .critical-dialog {
+      width: min(560px, 100%);
+      background: var(--surface);
+      border: 2px solid var(--critical);
+      border-radius: 8px;
+      box-shadow: 0 24px 70px rgba(15, 23, 42, 0.28);
+      overflow: hidden;
+    }
+
+    .critical-dialog-head {
+      padding: 14px 16px;
+      background: #fff2f0;
+      border-bottom: 1px solid #e3aaa5;
+    }
+
+    .critical-dialog-head h2 {
+      margin: 0;
+      color: var(--critical);
+      font-size: 18px;
+    }
+
+    .critical-dialog-body {
+      padding: 14px 16px;
+    }
+
+    .critical-dialog-list {
+      margin: 12px 0 0;
+      padding: 0;
+      list-style: none;
+      max-height: 260px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+    }
+
+    .critical-dialog-list li {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .critical-dialog-list li:last-child {
+      border-bottom: 0;
+    }
+
+    .critical-dialog-foot {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      padding: 12px 16px;
+      border-top: 1px solid var(--line);
+      background: #fbfcfe;
+    }
+
+    .critical-dialog-foot button {
+      background: var(--critical);
+      border-color: var(--critical);
+    }
+
     @media (max-width: 1050px) {
       .metrics { grid-template-columns: repeat(2, minmax(150px, 1fr)); }
       .layout { grid-template-columns: 1fr; }
@@ -571,6 +594,14 @@ DASHBOARD_HTML = r"""
       <div class="metric"><div class="label">Scenarios</div><div class="value" id="metricScenarios">0</div></div>
     </div>
 
+    <section class="latency-panel">
+      <div class="section-head">
+        <h2>Pipeline Latency</h2>
+        <span class="subtle">Round-trip measurements from dashboard/runner to each system</span>
+      </div>
+      <div id="latencyPanel"></div>
+    </section>
+
     <div class="layout">
       <section>
         <div class="section-head">
@@ -611,6 +642,21 @@ DASHBOARD_HTML = r"""
     </div>
   </main>
 
+  <div class="critical-dialog-backdrop" id="criticalDialog" role="dialog" aria-modal="true" aria-labelledby="criticalDialogTitle">
+    <div class="critical-dialog">
+      <div class="critical-dialog-head">
+        <h2 id="criticalDialogTitle">Pazienti critici rilevati</h2>
+      </div>
+      <div class="critical-dialog-body">
+        <strong>Ci sono pazienti con valori critici. Intervenire subito.</strong>
+        <ul class="critical-dialog-list" id="criticalDialogList"></ul>
+      </div>
+      <div class="critical-dialog-foot">
+        <button id="criticalDialogClose">Ho preso visione</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     let state = { patients: [], ward_counts: {}, risk_counts: {}, summary: {}, scenarios: [] };
     let benchmarkState = { status: "idle", running: false };
@@ -618,9 +664,16 @@ DASHBOARD_HTML = r"""
     let statusPoll = null;
 
     const riskOrder = { critical: 0, high: 1, medium: 2, low: 3, pending: 4 };
+    const pipelineLabels = {
+      cloud: "Google Cloud Run",
+      edge: "Edge HTTP",
+      edge_tls: "Edge TLS",
+      cloud_tls: "Cloud TLS",
+    };
 
     function riskBadge(level) {
-      return `<span class="risk ${level}">${level}</span>`;
+      const normalized = level || "pending";
+      return `<span class="risk ${normalized}">${normalized}</span>`;
     }
 
     function fmtMs(value) {
@@ -652,11 +705,12 @@ DASHBOARD_HTML = r"""
       if (!entries.length) return `<div class="subtle">Run the benchmark to populate pipeline comparison.</div>`;
       return `<div class="comparison"><h3>Pipeline comparison</h3><div class="comparison-grid">${entries.map(([name, data]) => `
         <div class="comparison-item">
-          <div class="name">${name}</div>
+          <div class="name">${pipelineLabels[name] || name}</div>
           <div class="mono">round trip: ${fmtMs(data.client_total_ms)}</div>
           <div class="mono">service: ${fmtMs(data.service_total_ms)}</div>
           <div class="mono">transport: ${data.transport_security || "plain"}</div>
           <div class="mono">payload: ${fmtKb(data.payload_sent_kb)}</div>
+          <div class="mono">risk: ${(data.risk_level || "n/a").toUpperCase()} (${data.risk_score ?? "n/a"})</div>
         </div>
       `).join("")}</div></div>`;
     }
@@ -677,6 +731,7 @@ DASHBOARD_HTML = r"""
         </div>
         <div class="kv">
           <div class="k">Diagnosis</div><div>${patient.diagnosis}</div>
+          <div class="k">Initial risk</div><div>${(patient.initial_risk_level || patient.risk_level || "pending").toUpperCase()} (${patient.initial_risk_score ?? patient.risk_score ?? "pending"})</div>
           <div class="k">Risk score</div><div>${patient.risk_score ?? "pending"}</div>
           <div class="k">Action</div><div>${patient.recommended_action}</div>
           <div class="k">Out of range</div><div>${(patient.abnormal_vitals || []).length ? patient.abnormal_vitals.map((item) => `${item.vital} ${item.value}${item.unit}`).join(", ") : "None"}</div>
@@ -722,6 +777,48 @@ DASHBOARD_HTML = r"""
       if (!selectedPatientId && rows.length) selectedPatientId = rows[0].patient_id;
     }
 
+    function renderLatencyPanel() {
+      const target = document.getElementById("latencyPanel");
+      const preferred = ["cloud", "edge", "edge_tls"];
+      const summary = state.summary || {};
+      const rows = preferred
+        .filter((name) => summary[name])
+        .map((name) => [name, summary[name]])
+        .concat(
+          Object.entries(summary).filter(([name]) => !preferred.includes(name))
+        );
+
+      if (!rows.length) {
+        target.innerHTML = `<div class="latency-empty">Run the benchmark to populate p99 latency for Google Cloud, Edge HTTP and Edge TLS.</div>`;
+        return;
+      }
+
+      target.innerHTML = `
+        <table class="latency-table">
+          <thead>
+            <tr>
+              <th>System</th>
+              <th>Runs</th>
+              <th>Mean round trip</th>
+              <th>P99 round trip</th>
+              <th>Mean service</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map(([name, data]) => `
+              <tr>
+                <td class="latency-name">${pipelineLabels[name] || name}</td>
+                <td>${data.runs ?? 0}</td>
+                <td>${fmtMs(data.client_total_ms?.mean)}</td>
+                <td><strong>${fmtMs(data.client_total_ms?.p99)}</strong></td>
+                <td>${fmtMs((data.mean_preprocess_ms || 0) + (data.mean_inference_ms || 0) + (data.mean_storage_ms || 0) + (data.mean_sync_ms || 0))}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      `;
+    }
+
     function renderWardBars() {
       const target = document.getElementById("wardBars");
       const entries = Object.entries(state.ward_counts || {}).sort((a, b) => b[1].alerts - a[1].alerts || b[1].patients - a[1].patients);
@@ -759,16 +856,71 @@ DASHBOARD_HTML = r"""
     function render() {
       renderFilters();
       renderMetrics();
+      renderLatencyPanel();
       renderRows();
       renderWardBars();
       const selected = state.patients.find((patient) => patient.patient_id === selectedPatientId) || filteredPatients()[0];
       renderDetail(selected);
     }
 
-    async function loadData() {
-      const response = await fetch("/api/patient-results", { cache: "no-store" });
+    async function loadData(options = {}) {
+      const url = options.pending ? "/api/patient-results?pending=true" : "/api/patient-results";
+      const response = await fetch(url, { cache: "no-store" });
       state = await response.json();
       render();
+    }
+
+    function resetDashboardForRun() {
+      state.generated_at = null;
+      state.scenarios = [];
+      state.summary = {};
+      state.risk_counts = { critical: 0, high: 0, medium: 0, low: 0, pending: state.patients.length };
+      state.ward_counts = Object.fromEntries(
+        [...new Set(state.patients.map((patient) => patient.ward))]
+          .sort()
+          .map((ward) => [
+            ward,
+            {
+              patients: state.patients.filter((patient) => patient.ward === ward).length,
+              alerts: 0,
+            },
+          ])
+      );
+      state.patients = state.patients.map((patient) => ({
+        ...patient,
+        initial_risk_score: null,
+        initial_risk_level: "pending",
+        risk_score: null,
+        risk_level: "pending",
+        recommended_action: "Waiting for pipeline response",
+        abnormal_vitals: [],
+        alert: false,
+        pipeline_comparison: {},
+      }));
+      render();
+    }
+
+    function criticalPatients() {
+      return (state.patients || []).filter((patient) => patient.risk_level === "critical");
+    }
+
+    function showCriticalDialogForCurrentRun() {
+      const patients = criticalPatients();
+      if (!patients.length) return;
+      const list = document.getElementById("criticalDialogList");
+      list.innerHTML = patients.map((patient) => `
+        <li>
+          <strong>${patient.name}</strong> (${patient.patient_id}) -
+          ${patient.ward} ${patient.bed} -
+          score ${patient.risk_score ?? "n/a"} -
+          ${patient.diagnosis}
+        </li>
+      `).join("");
+      document.getElementById("criticalDialog").classList.add("open");
+    }
+
+    function closeCriticalDialog() {
+      document.getElementById("criticalDialog").classList.remove("open");
     }
 
     function renderBenchmarkStatus() {
@@ -804,6 +956,7 @@ DASHBOARD_HTML = r"""
         stopStatusPolling();
         if (previousStatus === "running" && benchmarkState.status === "completed") {
           await loadData();
+          showCriticalDialogForCurrentRun();
         }
       } catch (error) {
         benchmarkState = { status: "unavailable", running: false };
@@ -830,6 +983,7 @@ DASHBOARD_HTML = r"""
         }
         benchmarkState = await response.json().catch(() => ({ status: "running", running: true }));
         renderBenchmarkStatus();
+        resetDashboardForRun();
         startStatusPolling();
       } catch (error) {
         benchmarkState = { status: "failed", running: false };
@@ -842,7 +996,11 @@ DASHBOARD_HTML = r"""
     document.getElementById("searchBox").addEventListener("input", render);
     document.getElementById("refreshButton").addEventListener("click", loadData);
     document.getElementById("runBenchmarkButton").addEventListener("click", runBenchmark);
-    loadData();
+    document.getElementById("criticalDialogClose").addEventListener("click", closeCriticalDialog);
+    document.getElementById("criticalDialog").addEventListener("click", (event) => {
+      if (event.target.id === "criticalDialog") closeCriticalDialog();
+    });
+    loadData({ pending: true });
     loadBenchmarkStatus();
   </script>
 </body>

@@ -128,6 +128,14 @@ edge_tls
 
 ## Avvio
 
+Avvio guidato da Windows:
+
+```text
+doppio click su start_benchmark.bat
+```
+
+Lo script controlla Docker, configura Cloud Run se manca `.env.gcp`, avvia lo stack e mostra gli URL locali.
+
 ```powershell
 .\scripts\deploy-cloud-run.ps1 -ProjectId benchmark-edge-cloud -Region europe-west8
 docker compose --env-file .env.gcp up --build
@@ -194,7 +202,7 @@ Deploy del container cloud:
 .\scripts\deploy-cloud-run.ps1 -ProjectId benchmark-edge-cloud -Region europe-west8
 ```
 
-Lo script usa `-MinInstances 1` come default per tenere Cloud Run caldo durante il benchmark e rendere il confronto edge/cloud piu' stabile. Per misurare il cold start usa:
+Lo script usa `-MinInstances 1` come default per tenere Cloud Run caldo durante il benchmark e rendere il confronto edge/cloud piu' stabile. Per esperimenti separati sul cold start reale di Cloud Run, usa:
 
 ```powershell
 .\scripts\deploy-cloud-run.ps1 -ProjectId benchmark-edge-cloud -Region europe-west8 -MinInstances 0
@@ -300,10 +308,9 @@ pipeline_stage_latency_ms
 pipeline_payload_size_kb
 pipeline_in_flight_requests
 pipeline_process_started_at_seconds
-pipeline_cold_start_requests_total
 ```
 
-Grafana visualizza queste metriche nel tempo. Per default Prometheus scrapa solo l'edge locale, cosi' non sveglia Cloud Run prima del benchmark e non falsa il cold start.
+Grafana visualizza queste metriche nel tempo. Per default Prometheus scrapa solo l'edge locale, cosi' il traffico di monitoraggio resta separato dal traffico del benchmark.
 
 La pipeline cloud espone comunque `/metrics` su Cloud Run. Se vuoi osservare anche le metriche applicative cloud con Prometheus, usa il file generato:
 
@@ -317,7 +324,7 @@ Avvio con scrape cloud abilitato:
 docker compose --env-file .env.gcp -f docker-compose.yml -f docker-compose.cloud-metrics.yml up --build
 ```
 
-Nota: uno scrape Prometheus verso Cloud Run e' una richiesta HTTP reale, quindi puo' avviare una istanza in cold start o tenerla calda. Per misurare il cold start, non abilitare lo scrape cloud prima di lanciare il benchmark. Per metriche infrastrutturali cloud senza disturbare il traffico applicativo, usa Cloud Monitoring di Google Cloud.
+Nota: uno scrape Prometheus verso Cloud Run e' una richiesta HTTP reale, quindi puo' avviare una istanza in cold start o tenerla calda. Il benchmark applicativo non espone piu' un contatore di cold start perche' un flag locale di "prima richiesta del processo" non rappresenta il reale avvio infrastrutturale del servizio. Per metriche infrastrutturali cloud senza disturbare il traffico applicativo, usa Cloud Monitoring di Google Cloud.
 
 ## Log pipeline
 
@@ -333,9 +340,7 @@ cloud_storage
 dashboard_response
 ```
 
-I log includono hash pseudonimizzato del paziente, reparto, letto, diagnosi, numero di campioni vitali, campi clinici usati, payload inviato, rischio calcolato e timing per step. Non vengono stampati nome paziente o valori grezzi dei parametri vitali.
-
-Il primo `/process` gestito da ogni istanza viene marcato con `cold_start_candidate=true` e contribuisce alla metrica `pipeline_cold_start_requests_total`. Se Cloud Run e' a `min-instances=0` e non viene svegliato da Prometheus o da altre richieste, il primo campione cloud del benchmark include il cold start.
+I log includono hash pseudonimizzato del paziente, reparto, letto, diagnosi, numero di campioni vitali, campi clinici usati, payload inviato, rischio calcolato, eta' del processo e timing per step. Non vengono stampati nome paziente o valori grezzi dei parametri vitali.
 
 L'edge locale e' configurato come `ward-gateway-0.5vcpu-256mb` con:
 

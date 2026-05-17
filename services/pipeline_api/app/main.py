@@ -46,7 +46,6 @@ SECURE_REPLAY_CHECK_MS = float(os.getenv("SECURE_REPLAY_CHECK_MS", "2"))
 SECURE_PACKET_OVERHEAD_KB = float(os.getenv("SECURE_PACKET_OVERHEAD_KB", "2"))
 PIPELINE_STEP_LOGS = os.getenv("PIPELINE_STEP_LOGS", "true").lower() == "true"
 PROCESS_STARTED_AT = time.time()
-FIRST_PROCESS_REQUEST_SEEN = False
 
 
 logging.basicConfig(
@@ -96,11 +95,6 @@ PROCESS_STARTED_AT_SECONDS = Gauge(
     "Unix timestamp for the current service process start.",
     ["service", "role"],
 )
-COLD_START_REQUESTS = Counter(
-    "pipeline_cold_start_requests_total",
-    "Requests that were the first /process call handled by this service process.",
-    ["service", "pipeline"],
-)
 PROCESS_STARTED_AT_SECONDS.labels(SERVICE_NAME, ROLE).set(PROCESS_STARTED_AT)
 
 
@@ -110,6 +104,7 @@ class ProcessRequest(BaseModel):
     complexity: float = Field(1.0, ge=0.1, le=10.0)
     security_profile: Literal["none", "secure", "simulated", "tls"] = "none"
     patient_record: dict[str, Any] | None = None
+    initial_risk_assessment: dict[str, Any] | None = None
 
 
 class SyncRequest(BaseModel):
@@ -163,6 +158,9 @@ def log_pipeline_step(
 ) -> None:
     if not PIPELINE_STEP_LOGS:
         return
+
+    if status == "start":
+        logger.info("#######-------- INIZIO STEP PIPELINE: %s -------- ######", step.upper())
 
     event = {
         "event": "clinical_pipeline_step",
@@ -314,15 +312,9 @@ async def metrics() -> Response:
 
 @app.post("/process")
 async def process(request: ProcessRequest) -> dict[str, Any]:
-    global FIRST_PROCESS_REQUEST_SEEN
-
     base_pipeline = "edge" if ROLE == "edge" else "cloud"
     security_profile = normalize_security_profile(request.security_profile)
     pipeline = pipeline_label(base_pipeline, security_profile)
-    cold_start_candidate = not FIRST_PROCESS_REQUEST_SEEN
-    if cold_start_candidate:
-        FIRST_PROCESS_REQUEST_SEEN = True
-        COLD_START_REQUESTS.labels(SERVICE_NAME, pipeline).inc()
     REQUESTS.labels(SERVICE_NAME, pipeline, "process").inc()
     payload_sent_kb = payload_size_kb(request.patient_record) if request.patient_record else float(request.data_size_kb)
     PAYLOAD_SIZE.labels(SERVICE_NAME, pipeline, "input").observe(payload_sent_kb)
@@ -339,8 +331,9 @@ async def process(request: ProcessRequest) -> dict[str, Any]:
             payload_sent_kb=round(payload_sent_kb, 3),
             security_profile=security_profile,
             transport_security=TRANSPORT_SECURITY,
+            initial_risk_score=(request.initial_risk_assessment or {}).get("risk_score"),
+            initial_risk_level=(request.initial_risk_assessment or {}).get("risk_level"),
             cloud_sync_enabled=bool(CLOUD_SYNC_URL),
-            cold_start_candidate=cold_start_candidate,
             process_age_ms=round((time.time() - PROCESS_STARTED_AT) * 1000, 3),
         )
         log_pipeline_step(
@@ -363,11 +356,12 @@ async def process(request: ProcessRequest) -> dict[str, Any]:
 
         log_pipeline_step(
             "transport_security",
-            "active" if security_profile == "tls" else "start" if security_profile == "simulated" else "skipped",
+            "start",
             pipeline,
             request.input_id,
             request.patient_record,
             profile=security_profile,
+            transport_status="active" if security_profile == "tls" else "simulated" if security_profile == "simulated" else "skipped",
             payload_kb=round(payload_sent_kb, 3),
             note="real_tls_terminates_before_application" if security_profile == "tls" else "",
         )
@@ -530,6 +524,15 @@ async def process(request: ProcessRequest) -> dict[str, Any]:
         TOTAL_LATENCY.labels(SERVICE_NAME, pipeline).observe(total_ms)
         log_pipeline_step(
             "dashboard_response",
+            "start",
+            pipeline,
+            request.input_id,
+            request.patient_record,
+            response_payload="patient_alert",
+            payload_synced_kb=round(payload_synced_kb, 3),
+        )
+        log_pipeline_step(
+            "dashboard_response",
             "done",
             pipeline,
             request.input_id,
@@ -544,7 +547,7 @@ async def process(request: ProcessRequest) -> dict[str, Any]:
             "service": SERVICE_NAME,
             "security_profile": security_profile,
             "transport_security": TRANSPORT_SECURITY,
-            "cold_start_candidate": cold_start_candidate,
+            "initial_risk_assessment": request.initial_risk_assessment,
             "process_age_ms": round((time.time() - PROCESS_STARTED_AT) * 1000, 3),
             "input_id": request.input_id,
             "payload_sent_kb": payload_sent_kb,

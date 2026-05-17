@@ -2,8 +2,9 @@
 
 Questo progetto confronta due pipeline di monitoraggio pazienti:
 
-- **Cloud pipeline**: il record clinico completo del paziente viene inviato al cloud, dove vengono eseguiti tutti i processamenti.
-- **Edge pipeline**: il record viene processato vicino al letto/reparto e viene generato un alert locale, senza includere sincronizzazione cloud nella latenza misurata.
+- **Cloud pipeline**: il campione wearable del paziente viene inviato a Google Cloud Run, che valida i dati e restituisce eventuali alert.
+- **Edge pipeline HTTP**: lo stesso campione viene inviato a un edge server locale senza TLS.
+- **Edge pipeline TLS**: lo stesso campione viene inviato a un edge server locale via HTTPS/TLS.
 
 Il benchmark usa un dataset fittizio ma realistico di 20 pazienti in [data/patients.json](data/patients.json), con reparto, letto, diagnosi, comorbidita', farmaci e serie temporale di parametri vitali.
 
@@ -33,37 +34,29 @@ La logica clinica e' in:
 services/pipeline_api/app/clinical.py
 ```
 
-Vengono calcolati:
+Vengono eseguiti:
 
 - validazione schema;
-- pulizia/range clamping dei parametri vitali;
-- filtro moving average sull'edge;
-- feature cliniche: ultimo valore, medie, trend;
-- score vitali;
-- score trend;
-- score contesto clinico;
-- livello di rischio: `low`, `medium`, `high`, `critical`;
+- validazione del campione wearable piu' recente;
+- controllo soglie fuori norma per frequenza cardiaca, pressione sistolica, frequenza respiratoria, SpO2, temperatura e glicemia;
+- livello alert: `low`, `medium`, `high`, `critical`;
 - azione raccomandata;
-- alert se rischio `high` o `critical`.
+- alert se almeno un valore e' fuori norma oppure il payload non e' valido.
 
 ## Pipeline cloud nel dettaglio
 
-La pipeline cloud riceve il record completo del paziente.
+La pipeline cloud riceve il campione wearable e restituisce l'alert alla dashboard/runner.
 
 ```text
-benchmark client
-  -> cloud-api /process
-  -> network delay simulato
-  -> validazione record
-  -> normalizzazione parametri vitali
-  -> feature extraction su tutta la serie temporale
-  -> risk scoring
-  -> triage / alert
-  -> storage del record completo
-  -> risposta al client
+dashboard / benchmark runner
+  -> Cloud Run /process
+  -> validazione payload wearable
+  -> controllo soglie fuori norma
+  -> alert generation
+  -> risposta alla dashboard/runner
 ```
 
-Informazioni inviate al cloud:
+Informazioni inviate al cloud per ogni campione:
 
 ```text
 demografia completa
@@ -71,7 +64,7 @@ reparto e letto
 diagnosi
 comorbidita'
 farmaci
-serie completa dei parametri vitali
+serie dei parametri vitali wearable
 ```
 
 Informazioni salvate dal cloud:
@@ -85,19 +78,15 @@ triage recommendation
 
 ## Pipeline edge nel dettaglio
 
-La pipeline edge riceve il record del paziente, ma processa localmente i dati e sincronizza al cloud solo un risultato ridotto.
+La pipeline edge riceve lo stesso campione del cloud e processa localmente i dati senza sincronizzare verso il cloud durante la misura. Esistono due varianti identiche come logica e risorse: HTTP e HTTPS/TLS.
 
 ```text
-benchmark client
+dashboard / benchmark runner
   -> edge-api /process
-  -> network delay locale simulato
-  -> validazione record
-  -> clamping parametri vitali
-  -> filtro moving average
-  -> feature extraction locale
-  -> early warning score
+  -> validazione payload wearable
+  -> controllo soglie fuori norma
   -> alert locale
-  -> risposta al client
+  -> risposta alla dashboard/runner
 ```
 
 Informazioni usate localmente dall'edge:
@@ -121,39 +110,35 @@ recommended_action
 alert
 ```
 
-Nel confronto diretto edge vs cloud la pipeline edge non invia dati al cloud durante la misurazione. Il campo `payload_synced_kb` resta quindi a `0` per gli scenari edge.
+Nel benchmark attuale l'edge non sincronizza dati verso Google Cloud Run. Il confronto misura la latenza end-to-end richiesta/risposta tra dashboard/runner e tre destinazioni: Cloud Run, edge HTTP, edge TLS.
 
 ## Scenari benchmark
 
-Per ogni paziente vengono eseguiti sei scenari:
+Per ogni paziente vengono eseguiti tre scenari, ripetuti 3 volte per ridurre il rumore delle singole misure:
 
 ```text
 cloud
 edge
-cloud_simulated_secure
-edge_simulated_secure
-cloud_tls
 edge_tls
 ```
 
-- `cloud`: processing completo in cloud via HTTP.
-- `edge`: processing locale edge via HTTP, senza sync cloud incluso.
-- `*_simulated_secure`: aggiunge delay simulato per TLS/HMAC/cifratura/anti-replay.
-- `*_tls`: usa HTTPS/mTLS reale con CA locale e certificato client.
+- `cloud`: processing completo su Google Cloud Run.
+- `edge`: processing locale edge via HTTP.
+- `edge_tls`: processing locale edge via HTTPS/TLS.
 
 ## Avvio
 
 ```powershell
-docker compose up --build
+.\scripts\deploy-cloud-run.ps1 -ProjectId benchmark-edge-cloud -Region europe-west8
+docker compose --env-file .env.gcp up --build
 ```
 
 Servizi:
 
 ```text
-Cloud API plain:       http://localhost:8000/docs
-Edge API plain:        http://localhost:8001/docs
-Cloud API TLS/mTLS:    https://localhost:8443/docs
-Edge API TLS/mTLS:     https://localhost:8444/docs
+Cloud API:             Google Cloud Run URL in .env.gcp
+Edge API locale:       http://localhost:8001/docs
+Edge API TLS locale:   https://localhost:8444/docs
 Hospital dashboard:    http://localhost:8080
 Benchmark API:         http://localhost:8090
 Prometheus:            http://localhost:9090
@@ -170,7 +155,7 @@ password: admin
 ## Lanciare il benchmark clinico
 
 ```powershell
-docker compose run --rm benchmark
+docker compose --env-file .env.gcp run --rm benchmark
 ```
 
 Output:
@@ -183,9 +168,9 @@ results/patient_results.json
 
 `patient_results.json` alimenta la dashboard ospedaliera.
 
-## Benchmark ibrido con Google Cloud Run
+## Pipeline cloud su Google Cloud Run
 
-Per avvicinare il benchmark a uno scenario reale, puoi deployare il servizio cloud su Google Cloud Run e lasciare in locale l'edge, Prometheus, Grafana, dashboard e benchmark runner.
+Il benchmark usa Google Cloud Run come unica pipeline cloud. Docker avvia solo l'edge locale, Prometheus, Grafana, dashboard e benchmark runner.
 
 Configurazione consigliata:
 
@@ -209,24 +194,39 @@ Deploy del container cloud:
 .\scripts\deploy-cloud-run.ps1 -ProjectId benchmark-edge-cloud -Region europe-west8
 ```
 
+Lo script usa `-MinInstances 1` come default per tenere Cloud Run caldo durante il benchmark e rendere il confronto edge/cloud piu' stabile. Per misurare il cold start usa:
+
+```powershell
+.\scripts\deploy-cloud-run.ps1 -ProjectId benchmark-edge-cloud -Region europe-west8 -MinInstances 0
+```
+
+Oppure, se il servizio e' gia' deployato:
+
+```powershell
+gcloud run services update benchmark-cloud-api --region europe-west8 --min-instances 0
+gcloud run services update benchmark-cloud-api --region europe-west8 --min-instances 1
+```
+
 Lo script:
 
 - abilita le API necessarie;
 - crea il repository Docker in Artifact Registry se manca;
 - builda `services/pipeline_api`;
 - deploya `benchmark-cloud-api` su Cloud Run;
-- genera `.env.gcp` e `prometheus/prometheus.gcp.yml` per il benchmark ibrido.
+- genera `.env.gcp` e `prometheus/prometheus.gcp.yml`.
 
-Avvio dello scenario ibrido:
+Il compose imposta `DATASET_REPEATS=3`, quindi il benchmark produce 180 richieste totali: 20 pazienti x 3 scenari x 3 ripetizioni.
+
+Avvio dello stack:
 
 ```powershell
-docker compose --env-file .env.gcp -f docker-compose.yml -f docker-compose.gcp.yml up --build
+docker compose --env-file .env.gcp up --build
 ```
 
-Lancio benchmark ibrido:
+Lancio benchmark:
 
 ```powershell
-docker compose --env-file .env.gcp -f docker-compose.yml -f docker-compose.gcp.yml run --rm benchmark
+docker compose --env-file .env.gcp run --rm benchmark
 ```
 
 In questa modalita' vengono eseguiti:
@@ -234,17 +234,18 @@ In questa modalita' vengono eseguiti:
 ```text
 cloud
 edge
-cloud_simulated_secure
-edge_simulated_secure
+edge_tls
 ```
 
-Gli scenari `cloud_tls` ed `edge_tls` restano nel profilo locale perche' usano mTLS terminato dentro i container. Su Cloud Run l'HTTPS pubblico e' terminato dalla piattaforma; per mTLS reale su Google Cloud conviene aggiungere un Application Load Balancer con mTLS oppure passare a GKE/Compute Engine.
+Lo scenario `edge_tls` usa TLS reale terminato dall'edge locale. Su Cloud Run l'HTTPS pubblico e' terminato dalla piattaforma Google Cloud.
 
 Se il servizio Cloud Run e' gia' deployato e vuoi solo riconfigurare l'endpoint locale:
 
 ```powershell
 .\scripts\configure-gcp-hybrid.ps1 -CloudRunUrl https://URL-CLOUD-RUN -ProjectId benchmark-edge-cloud -Region europe-west8
 ```
+
+Cloud Run non chiama direttamente la dashboard locale a fine pipeline: la dashboard/runner invia il campione a Cloud Run e riceve la risposta HTTP con l'alert. Un callback Cloud Run -> PC richiederebbe un endpoint pubblico o un tunnel, e introdurrebbe latenza esterna non utile per questo benchmark.
 
 ## Dashboard ospedaliera
 
@@ -262,7 +263,7 @@ La dashboard mostra:
 - parametri vitali piu' recenti;
 - diagnosi, farmaci, comorbidita';
 - azione raccomandata;
-- confronto cloud/edge/TLS per latenza, sync e payload inviato al cloud;
+- confronto cloud/edge per latenza, trasporto e payload inviato al server;
 - carico per reparto e alert attivi.
 
 La dashboard puo' anche avviare il benchmark tramite il pulsante:
@@ -298,9 +299,53 @@ pipeline_total_latency_ms
 pipeline_stage_latency_ms
 pipeline_payload_size_kb
 pipeline_in_flight_requests
+pipeline_process_started_at_seconds
+pipeline_cold_start_requests_total
 ```
 
-Grafana visualizza queste metriche nel tempo. La dashboard ospedaliera invece visualizza i risultati clinici del benchmark.
+Grafana visualizza queste metriche nel tempo. Per default Prometheus scrapa solo l'edge locale, cosi' non sveglia Cloud Run prima del benchmark e non falsa il cold start.
+
+La pipeline cloud espone comunque `/metrics` su Cloud Run. Se vuoi osservare anche le metriche applicative cloud con Prometheus, usa il file generato:
+
+```text
+prometheus/prometheus.gcp.with-cloud.yml
+```
+
+Avvio con scrape cloud abilitato:
+
+```powershell
+docker compose --env-file .env.gcp -f docker-compose.yml -f docker-compose.cloud-metrics.yml up --build
+```
+
+Nota: uno scrape Prometheus verso Cloud Run e' una richiesta HTTP reale, quindi puo' avviare una istanza in cold start o tenerla calda. Per misurare il cold start, non abilitare lo scrape cloud prima di lanciare il benchmark. Per metriche infrastrutturali cloud senza disturbare il traffico applicativo, usa Cloud Monitoring di Google Cloud.
+
+## Log pipeline
+
+I servizi emettono log JSON per rendere espliciti gli step clinici eseguiti sui dati sanitari. Nei log di Cloud Run e nei log Docker dell'edge troverai eventi `clinical_pipeline_step` con:
+
+```text
+request_received
+network_uplink
+transport_security
+wearable_payload_validation
+abnormal_threshold_check
+cloud_storage
+dashboard_response
+```
+
+I log includono hash pseudonimizzato del paziente, reparto, letto, diagnosi, numero di campioni vitali, campi clinici usati, payload inviato, rischio calcolato e timing per step. Non vengono stampati nome paziente o valori grezzi dei parametri vitali.
+
+Il primo `/process` gestito da ogni istanza viene marcato con `cold_start_candidate=true` e contribuisce alla metrica `pipeline_cold_start_requests_total`. Se Cloud Run e' a `min-instances=0` e non viene svegliato da Prometheus o da altre richieste, il primo campione cloud del benchmark include il cold start.
+
+L'edge locale e' configurato come `ward-gateway-0.5vcpu-256mb` con:
+
+```text
+cpus: 0.5
+mem_limit: 256m
+pids_limit: 128
+```
+
+I delay `PREPROCESS_MS` e `INFERENCE_MS` sono piu' alti rispetto al cloud per simulare hardware edge meno potente.
 
 ## File principali
 
@@ -311,17 +356,17 @@ services/pipeline_api/app/main.py          API cloud/edge
 services/benchmark/benchmark.py            runner benchmark
 services/benchmark_api/app/main.py         API controllo benchmark
 services/hospital_dashboard/app/main.py    gestionale ospedaliero
-docker-compose.yml                         orchestrazione
+docker-compose.yml                         orchestrazione edge locale + Cloud Run
 docs/cloud-edge-pipeline-benchmark-report.pdf
 ```
 
 ## Note sicurezza
 
-I certificati TLS sono generati localmente da `certgen` e ignorati da Git:
+Il traffico verso Cloud Run usa HTTPS terminato dalla piattaforma Google Cloud. Lo scenario `edge_tls` usa TLS reale sull'edge locale con certificati generati dal servizio `certgen`.
+
+I certificati locali delle versioni precedenti restano ignorati da Git:
 
 ```text
 certs/*.crt
 certs/*.key
 ```
-
-Sono adatti per benchmark locale, non per produzione.

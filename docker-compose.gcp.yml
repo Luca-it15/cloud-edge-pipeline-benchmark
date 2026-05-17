@@ -1,49 +1,6 @@
-services:
-  certgen:
-    profiles:
-      - local-tls
+name: cloud-edge-benchmark
 
-  cloud-api:
-    profiles:
-      - local-cloud
-
-  cloud-api-tls:
-    profiles:
-      - local-tls
-
-  edge-api:
-    environment:
-      CLOUD_SYNC_URL: ""
-    depends_on: !reset []
-
-  edge-api-tls:
-    profiles:
-      - local-tls
-
-  benchmark:
-    environment:
-      CLOUD_URL: ${GCP_CLOUD_URL:?Run scripts/configure-gcp-hybrid.ps1 with the Cloud Run URL first}/process
-      EDGE_URL: http://edge-api:8000/process
-      BENCHMARK_SCENARIOS: cloud,edge,cloud_simulated_secure,edge_simulated_secure
-      REQUEST_TIMEOUT_SECONDS: 60
-    depends_on: !override
-      edge-api:
-        condition: service_healthy
-
-  benchmark-api:
-    environment:
-      CLOUD_URL: ${GCP_CLOUD_URL:?Run scripts/configure-gcp-hybrid.ps1 with the Cloud Run URL first}/process
-      EDGE_URL: http://edge-api:8000/process
-      BENCHMARK_SCENARIOS: cloud,edge,cloud_simulated_secure,edge_simulated_secure
-      REQUEST_TIMEOUT_SECONDS: 60
-    depends_on: !override
-      edge-api:
-        condition: service_healthy
-
-  prometheus:
-    volumes:
-      - ./prometheus/prometheus.gcp.yml:/etc/prometheus/prometheus.yml:ro
-      - ./certs:/certs:ro
-    depends_on: !override
-      edge-api:
-        condition: service_healthy
+# Compatibility override kept for older commands that still pass
+# `-f docker-compose.yml -f docker-compose.gcp.yml`.
+# The main compose file now runs the Google Cloud hybrid benchmark by default.
+services: {}

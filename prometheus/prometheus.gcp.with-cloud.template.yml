@@ -18,3 +18,13 @@ scrape_configs:
     static_configs:
       - targets:
           - edge-api-tls:8443
+
+  # This scrape hits Cloud Run and can cold-start or keep warm the cloud service.
+  # Use it only when observing cloud pipeline metrics matters more than preserving
+  # a clean cold-start latency measurement.
+  - job_name: cloud-api-gcp
+    scheme: https
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - __GCP_CLOUD_HOST__:443

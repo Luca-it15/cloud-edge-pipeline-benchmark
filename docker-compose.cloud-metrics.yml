@@ -1,0 +1,4 @@
+services:
+  prometheus:
+    volumes:
+      - ./prometheus/prometheus.gcp.with-cloud.yml:/etc/prometheus/prometheus.yml:ro

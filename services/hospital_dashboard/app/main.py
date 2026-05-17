@@ -124,6 +124,7 @@ def base_payload() -> dict[str, Any]:
                 "risk_score": score,
                 "risk_level": level,
                 "recommended_action": action(level),
+                "abnormal_vitals": [],
                 "alert": is_alert,
                 "pipeline_comparison": {},
             }
@@ -652,9 +653,10 @@ DASHBOARD_HTML = r"""
       return `<div class="comparison"><h3>Pipeline comparison</h3><div class="comparison-grid">${entries.map(([name, data]) => `
         <div class="comparison-item">
           <div class="name">${name}</div>
-          <div class="mono">latency: ${fmtMs(data.client_total_ms)}</div>
-          <div class="mono">cloud sync: ${fmtMs(data.sync_ms)}</div>
-          <div class="mono">cloud payload: ${fmtKb(data.payload_synced_kb)}</div>
+          <div class="mono">round trip: ${fmtMs(data.client_total_ms)}</div>
+          <div class="mono">service: ${fmtMs(data.service_total_ms)}</div>
+          <div class="mono">transport: ${data.transport_security || "plain"}</div>
+          <div class="mono">payload: ${fmtKb(data.payload_sent_kb)}</div>
         </div>
       `).join("")}</div></div>`;
     }
@@ -677,6 +679,7 @@ DASHBOARD_HTML = r"""
           <div class="k">Diagnosis</div><div>${patient.diagnosis}</div>
           <div class="k">Risk score</div><div>${patient.risk_score ?? "pending"}</div>
           <div class="k">Action</div><div>${patient.recommended_action}</div>
+          <div class="k">Out of range</div><div>${(patient.abnormal_vitals || []).length ? patient.abnormal_vitals.map((item) => `${item.vital} ${item.value}${item.unit}`).join(", ") : "None"}</div>
           <div class="k">Comorbidities</div><div>${patient.comorbidities.length ? patient.comorbidities.join(", ") : "None recorded"}</div>
           <div class="k">Medications</div><div>${patient.medications.length ? patient.medications.join(", ") : "None recorded"}</div>
         </div>

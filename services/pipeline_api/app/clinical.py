@@ -5,6 +5,14 @@ from typing import Any
 
 
 VITAL_KEYS = ["heart_rate", "systolic_bp", "respiratory_rate", "spo2", "temperature", "glucose"]
+VITAL_RANGES = {
+    "heart_rate": (50.0, 110.0, "bpm"),
+    "systolic_bp": (90.0, 160.0, "mmHg"),
+    "respiratory_rate": (10.0, 24.0, "/min"),
+    "spo2": (94.0, 100.0, "%"),
+    "temperature": (35.8, 38.0, "C"),
+    "glucose": (70.0, 180.0, "mg/dL"),
+}
 
 
 def payload_size_kb(payload: Any) -> float:
@@ -47,6 +55,74 @@ def clean_vital_sample(sample: dict[str, Any]) -> dict[str, float]:
         "spo2": clamp(float(sample["spo2"]), 50, 100),
         "temperature": clamp(float(sample["temperature"]), 30, 43),
         "glucose": clamp(float(sample["glucose"]), 40, 500),
+    }
+
+
+def abnormal_vitals(sample: dict[str, Any]) -> list[dict[str, Any]]:
+    cleaned = clean_vital_sample(sample)
+    findings: list[dict[str, Any]] = []
+    for key, (low, high, unit) in VITAL_RANGES.items():
+        value = cleaned[key]
+        if value < low or value > high:
+            findings.append(
+                {
+                    "vital": key,
+                    "value": value,
+                    "unit": unit,
+                    "normal_min": low,
+                    "normal_max": high,
+                    "direction": "low" if value < low else "high",
+                }
+            )
+    return findings
+
+
+def validation_summary(patient: dict[str, Any], errors: list[str]) -> dict[str, Any]:
+    vitals = patient.get("vitals", [])
+    latest = vitals[-1] if isinstance(vitals, list) and vitals else {}
+    return {
+        "valid": not errors,
+        "errors": errors,
+        "vital_samples": len(vitals) if isinstance(vitals, list) else 0,
+        "latest_timestamp": latest.get("timestamp", ""),
+        "required_vitals": VITAL_KEYS,
+    }
+
+
+def alert_from_findings(findings: list[dict[str, Any]]) -> tuple[int, str, str]:
+    if any(item["vital"] == "spo2" and item["value"] < 90 for item in findings):
+        return 10, "critical", "Immediate physician review and continuous monitoring"
+    if len(findings) >= 3:
+        return 8, "high", "Nurse escalation and repeat vitals within 15 minutes"
+    if findings:
+        return 4, "medium", "Repeat vitals within 30 minutes and review treatment plan"
+    return 0, "low", "Routine monitoring"
+
+
+def wearable_alert_result(patient: dict[str, Any], vitals: list[dict[str, Any]]) -> dict[str, Any]:
+    latest = clean_vital_sample(vitals[-1])
+    findings = abnormal_vitals(vitals[-1])
+    score, level, recommended = alert_from_findings(findings)
+    return {
+        "patient_id": patient["patient_id"],
+        "patient_hash": pseudonymize(patient["patient_id"]),
+        "ward": patient["ward"],
+        "bed": patient["bed"],
+        "age": patient["age"],
+        "primary_diagnosis": patient["primary_diagnosis"],
+        "risk_score": score,
+        "risk_level": level,
+        "component_scores": {
+            "out_of_range_vitals": len(findings),
+            "schema_validation": 0,
+            "context": 0,
+        },
+        "features": {
+            "latest": latest,
+            "abnormal_vitals": findings,
+        },
+        "recommended_action": recommended,
+        "abnormal_vitals": findings,
     }
 
 
@@ -209,32 +285,33 @@ def compute_risk(patient: dict[str, Any], vitals: list[dict[str, Any]]) -> dict[
 def cloud_pipeline_result(patient: dict[str, Any]) -> dict[str, Any]:
     validation_errors = validate_patient_record(patient)
     vitals = patient["vitals"]
-    risk = compute_risk(patient, vitals)
+    risk = wearable_alert_result(patient, vitals)
     return {
-        "processing_mode": "cloud_full_record",
+        "processing_mode": "cloud_wearable_alert_validation",
         "validation_errors": validation_errors,
+        "validation": validation_summary(patient, validation_errors),
         "stored_payload": "full_patient_record",
         "stored_fields": [
             "demographics",
             "diagnosis",
             "comorbidities",
             "medications",
-            "full_vital_timeseries",
-            "risk_assessment",
+            "wearable_vital_timeseries",
+            "out_of_range_alert",
         ],
         "risk": risk,
-        "alert": risk["risk_level"] in {"high", "critical"},
+        "alert": bool(validation_errors) or bool(risk["abnormal_vitals"]),
         "clinical_payload": {
             "patient": patient,
             "risk": risk,
+            "alert": bool(validation_errors) or bool(risk["abnormal_vitals"]),
         },
     }
 
 
 def edge_pipeline_result(patient: dict[str, Any]) -> dict[str, Any]:
     validation_errors = validate_patient_record(patient)
-    smoothed_vitals = smooth_vitals(patient["vitals"])
-    risk = compute_risk(patient, smoothed_vitals)
+    risk = wearable_alert_result(patient, patient["vitals"])
     edge_summary = {
         "patient_id": patient["patient_id"],
         "patient_hash": risk["patient_hash"],
@@ -243,19 +320,19 @@ def edge_pipeline_result(patient: dict[str, Any]) -> dict[str, Any]:
         "latest_vitals": risk["features"]["latest"],
         "risk_score": risk["risk_score"],
         "risk_level": risk["risk_level"],
+        "abnormal_vitals": risk["abnormal_vitals"],
         "recommended_action": risk["recommended_action"],
-        "alert": risk["risk_level"] in {"high", "critical"},
+        "alert": bool(validation_errors) or bool(risk["abnormal_vitals"]),
     }
     return {
-        "processing_mode": "edge_local_summary",
+        "processing_mode": "edge_wearable_alert_validation",
         "validation_errors": validation_errors,
+        "validation": validation_summary(patient, validation_errors),
         "local_steps": [
             "schema_validation",
-            "vital_range_clamping",
-            "moving_average_noise_filter",
-            "early_warning_score",
+            "wearable_sample_validation",
+            "out_of_range_threshold_check",
             "local_alert_generation",
-            "reduced_cloud_sync",
         ],
         "risk": risk,
         "alert": edge_summary["alert"],

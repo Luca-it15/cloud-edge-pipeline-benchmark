@@ -1,4 +1,6 @@
 import asyncio
+import json
+import logging
 import os
 import ssl
 import time
@@ -14,11 +16,13 @@ from app.clinical import (
     cloud_pipeline_result,
     edge_pipeline_result,
     payload_size_kb,
+    pseudonymize,
 )
 
 
 ROLE = os.getenv("ROLE", "cloud").lower()
 SERVICE_NAME = os.getenv("SERVICE_NAME", ROLE)
+EDGE_DEVICE_PROFILE = os.getenv("EDGE_DEVICE_PROFILE", "")
 PORT = int(os.getenv("PORT", "8000"))
 CLOUD_SYNC_URL = os.getenv("CLOUD_SYNC_URL", "")
 TLS_CERT_FILE = os.getenv("TLS_CERT_FILE", "")
@@ -40,6 +44,16 @@ SECURE_AUTH_MS = float(os.getenv("SECURE_AUTH_MS", "4"))
 SECURE_CRYPTO_MS_PER_MB = float(os.getenv("SECURE_CRYPTO_MS_PER_MB", "7"))
 SECURE_REPLAY_CHECK_MS = float(os.getenv("SECURE_REPLAY_CHECK_MS", "2"))
 SECURE_PACKET_OVERHEAD_KB = float(os.getenv("SECURE_PACKET_OVERHEAD_KB", "2"))
+PIPELINE_STEP_LOGS = os.getenv("PIPELINE_STEP_LOGS", "true").lower() == "true"
+PROCESS_STARTED_AT = time.time()
+FIRST_PROCESS_REQUEST_SEEN = False
+
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("pipeline")
 
 
 app = FastAPI(
@@ -77,6 +91,17 @@ IN_FLIGHT = Gauge(
     "Requests currently being processed.",
     ["service", "pipeline"],
 )
+PROCESS_STARTED_AT_SECONDS = Gauge(
+    "pipeline_process_started_at_seconds",
+    "Unix timestamp for the current service process start.",
+    ["service", "role"],
+)
+COLD_START_REQUESTS = Counter(
+    "pipeline_cold_start_requests_total",
+    "Requests that were the first /process call handled by this service process.",
+    ["service", "pipeline"],
+)
+PROCESS_STARTED_AT_SECONDS.labels(SERVICE_NAME, ROLE).set(PROCESS_STARTED_AT)
 
 
 class ProcessRequest(BaseModel):
@@ -98,6 +123,60 @@ class SyncRequest(BaseModel):
 
 def now_ms() -> float:
     return time.perf_counter() * 1000
+
+
+def patient_log_context(patient: dict[str, Any] | None) -> dict[str, Any]:
+    if not patient:
+        return {"data_source": "synthetic_payload"}
+
+    return {
+        "data_source": "patient_record",
+        "patient_hash": pseudonymize(str(patient.get("patient_id", ""))),
+        "ward": patient.get("ward"),
+        "bed": patient.get("bed"),
+        "diagnosis": patient.get("primary_diagnosis"),
+        "vital_samples": len(patient.get("vitals", [])) if isinstance(patient.get("vitals"), list) else 0,
+        "clinical_fields": [
+            key
+            for key in [
+                "age",
+                "sex",
+                "ward",
+                "bed",
+                "primary_diagnosis",
+                "comorbidities",
+                "medications",
+                "vitals",
+            ]
+            if key in patient
+        ],
+    }
+
+
+def log_pipeline_step(
+    step: str,
+    status: str,
+    pipeline: str,
+    input_id: str,
+    patient: dict[str, Any] | None,
+    **details: Any,
+) -> None:
+    if not PIPELINE_STEP_LOGS:
+        return
+
+    event = {
+        "event": "clinical_pipeline_step",
+        "service": SERVICE_NAME,
+        "role": ROLE,
+        "pipeline": pipeline,
+        "input_id": input_id,
+        "step": step,
+        "status": status,
+        "edge_device_profile": EDGE_DEVICE_PROFILE if ROLE == "edge" else "",
+        **patient_log_context(patient),
+        **details,
+    }
+    logger.info(json.dumps(event, separators=(",", ":"), sort_keys=True, default=str))
 
 
 def busy_work(duration_ms: float) -> None:
@@ -188,6 +267,23 @@ async def sync_to_cloud(
     if not CLOUD_SYNC_URL:
         return 0.0
 
+    logger.info(
+        json.dumps(
+            {
+                "event": "edge_cloud_sync",
+                "service": SERVICE_NAME,
+                "role": ROLE,
+                "input_id": input_id,
+                "destination": CLOUD_SYNC_URL,
+                "payload_kind": "reduced_clinical_summary",
+                "result_payload_kb": result_payload_kb,
+                "security_profile": security_profile,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+            default=str,
+        )
+    )
     start = now_ms()
     payload = {
         "input_id": input_id,
@@ -208,7 +304,7 @@ async def sync_to_cloud(
 
 @app.get("/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok", "service": SERVICE_NAME, "role": ROLE}
+    return {"status": "ok", "service": SERVICE_NAME, "role": ROLE, "edge_device_profile": EDGE_DEVICE_PROFILE}
 
 
 @app.get("/metrics")
@@ -218,9 +314,15 @@ async def metrics() -> Response:
 
 @app.post("/process")
 async def process(request: ProcessRequest) -> dict[str, Any]:
+    global FIRST_PROCESS_REQUEST_SEEN
+
     base_pipeline = "edge" if ROLE == "edge" else "cloud"
     security_profile = normalize_security_profile(request.security_profile)
     pipeline = pipeline_label(base_pipeline, security_profile)
+    cold_start_candidate = not FIRST_PROCESS_REQUEST_SEEN
+    if cold_start_candidate:
+        FIRST_PROCESS_REQUEST_SEEN = True
+        COLD_START_REQUESTS.labels(SERVICE_NAME, pipeline).inc()
     REQUESTS.labels(SERVICE_NAME, pipeline, "process").inc()
     payload_sent_kb = payload_size_kb(request.patient_record) if request.patient_record else float(request.data_size_kb)
     PAYLOAD_SIZE.labels(SERVICE_NAME, pipeline, "input").observe(payload_sent_kb)
@@ -228,22 +330,128 @@ async def process(request: ProcessRequest) -> dict[str, Any]:
 
     total_start = now_ms()
     try:
+        log_pipeline_step(
+            "request_received",
+            "start",
+            pipeline,
+            request.input_id,
+            request.patient_record,
+            payload_sent_kb=round(payload_sent_kb, 3),
+            security_profile=security_profile,
+            transport_security=TRANSPORT_SECURITY,
+            cloud_sync_enabled=bool(CLOUD_SYNC_URL),
+            cold_start_candidate=cold_start_candidate,
+            process_age_ms=round((time.time() - PROCESS_STARTED_AT) * 1000, 3),
+        )
+        log_pipeline_step(
+            "network_uplink",
+            "start",
+            pipeline,
+            request.input_id,
+            request.patient_record,
+            simulated_delay_ms=NETWORK_UPLINK_MS,
+        )
         network_ms = await timed_async_sleep("network_uplink", pipeline, NETWORK_UPLINK_MS)
+        log_pipeline_step(
+            "network_uplink",
+            "done",
+            pipeline,
+            request.input_id,
+            request.patient_record,
+            elapsed_ms=round(network_ms, 3),
+        )
+
+        log_pipeline_step(
+            "transport_security",
+            "active" if security_profile == "tls" else "start" if security_profile == "simulated" else "skipped",
+            pipeline,
+            request.input_id,
+            request.patient_record,
+            profile=security_profile,
+            payload_kb=round(payload_sent_kb, 3),
+            note="real_tls_terminates_before_application" if security_profile == "tls" else "",
+        )
         security_timings = await apply_security_profile(
             security_profile,
             pipeline,
             payload_sent_kb,
         )
+        if security_profile == "simulated":
+            log_pipeline_step(
+                "transport_security",
+                "done",
+                pipeline,
+                request.input_id,
+                request.patient_record,
+                elapsed_ms=round(security_timings["security_ms"], 3),
+                overhead_kb=security_timings["security_overhead_kb"],
+            )
 
         if request.patient_record:
-            preprocess_ms = await timed_cpu_stage("clinical_preprocess", pipeline, PREPROCESS_MS * request.complexity)
+            log_pipeline_step(
+                "wearable_payload_validation",
+                "start",
+                pipeline,
+                request.input_id,
+                request.patient_record,
+                operations=[
+                    "schema_validation",
+                    "wearable_sample_validation",
+                    "required_vital_fields_check",
+                ],
+            )
+            preprocess_ms = await timed_cpu_stage("wearable_payload_validation", pipeline, PREPROCESS_MS * request.complexity)
+            log_pipeline_step(
+                "wearable_payload_validation",
+                "done",
+                pipeline,
+                request.input_id,
+                request.patient_record,
+                elapsed_ms=round(preprocess_ms, 3),
+            )
+            log_pipeline_step(
+                "abnormal_threshold_check",
+                "start",
+                pipeline,
+                request.input_id,
+                request.patient_record,
+                operations=[
+                    "latest_vitals_extraction",
+                    "normal_range_comparison",
+                    "alert_generation",
+                ],
+            )
             if base_pipeline == "cloud":
                 clinical_result = cloud_pipeline_result(request.patient_record)
             else:
                 clinical_result = edge_pipeline_result(request.patient_record)
-            inference_ms = await timed_cpu_stage("clinical_risk_scoring", pipeline, INFERENCE_MS * request.complexity)
+            inference_ms = await timed_cpu_stage("abnormal_threshold_check", pipeline, INFERENCE_MS * request.complexity)
             result_payload_kb = payload_size_kb(clinical_result["clinical_payload"])
+            risk = clinical_result["risk"]
+            log_pipeline_step(
+                "abnormal_threshold_check",
+                "done",
+                pipeline,
+                request.input_id,
+                request.patient_record,
+                elapsed_ms=round(inference_ms, 3),
+                validation_errors=clinical_result["validation_errors"],
+                risk_score=risk["risk_score"],
+                risk_level=risk["risk_level"],
+                abnormal_vitals=risk.get("abnormal_vitals", []),
+                alert=clinical_result["alert"],
+                result_payload_kb=round(result_payload_kb, 3),
+                output_payload=clinical_result["processing_mode"],
+            )
         else:
+            log_pipeline_step(
+                "synthetic_preprocess",
+                "start",
+                pipeline,
+                request.input_id,
+                None,
+                data_size_kb=request.data_size_kb,
+            )
             preprocess_ms = await timed_cpu_stage("preprocess", pipeline, PREPROCESS_MS * request.complexity)
             inference_ms = await timed_cpu_stage("inference", pipeline, INFERENCE_MS * request.complexity)
             result_payload_kb = max(1.0, payload_sent_kb * RESULT_PAYLOAD_RATIO)
@@ -265,13 +473,38 @@ async def process(request: ProcessRequest) -> dict[str, Any]:
         }
 
         if base_pipeline == "cloud":
+            log_pipeline_step(
+                "cloud_storage",
+                "start",
+                pipeline,
+                request.input_id,
+                request.patient_record,
+                stored_payload="full_patient_record" if request.patient_record else "synthetic_result",
+            )
             storage_ms = await timed_async_sleep("storage", pipeline, STORAGE_MS)
+            log_pipeline_step(
+                "cloud_storage",
+                "done",
+                pipeline,
+                request.input_id,
+                request.patient_record,
+                elapsed_ms=round(storage_ms, 3),
+            )
             timings["storage_ms"] = storage_ms
             timings["sync_ms"] = 0.0
             payload_synced_kb = payload_sent_kb
         else:
             sync_ms = 0.0
             if CLOUD_SYNC_URL:
+                log_pipeline_step(
+                    "edge_to_cloud_sync",
+                    "start",
+                    pipeline,
+                    request.input_id,
+                    request.patient_record,
+                    synced_payload="reduced_clinical_summary",
+                    destination=CLOUD_SYNC_URL,
+                )
                 sync_ms = await sync_to_cloud(
                     request.input_id,
                     result_payload_kb,
@@ -280,18 +513,39 @@ async def process(request: ProcessRequest) -> dict[str, Any]:
                     clinical_result["clinical_payload"],
                 )
                 STAGE_LATENCY.labels(SERVICE_NAME, pipeline, "cloud_sync").observe(sync_ms)
+                log_pipeline_step(
+                    "edge_to_cloud_sync",
+                    "done",
+                    pipeline,
+                    request.input_id,
+                    request.patient_record,
+                    elapsed_ms=round(sync_ms, 3),
+                    payload_synced_kb=round(result_payload_kb, 3),
+                )
             timings["storage_ms"] = 0.0
             timings["sync_ms"] = sync_ms
             payload_synced_kb = result_payload_kb if CLOUD_SYNC_URL else 0.0
 
         total_ms = now_ms() - total_start
         TOTAL_LATENCY.labels(SERVICE_NAME, pipeline).observe(total_ms)
+        log_pipeline_step(
+            "dashboard_response",
+            "done",
+            pipeline,
+            request.input_id,
+            request.patient_record,
+            total_ms=round(total_ms, 3),
+            response_payload="patient_alert",
+            payload_synced_kb=round(payload_synced_kb, 3),
+        )
 
         return {
             "pipeline": pipeline,
             "service": SERVICE_NAME,
             "security_profile": security_profile,
             "transport_security": TRANSPORT_SECURITY,
+            "cold_start_candidate": cold_start_candidate,
+            "process_age_ms": round((time.time() - PROCESS_STARTED_AT) * 1000, 3),
             "input_id": request.input_id,
             "payload_sent_kb": payload_sent_kb,
             "payload_synced_kb": payload_synced_kb,
@@ -311,12 +565,40 @@ async def sync(request: SyncRequest) -> dict[str, Any]:
     pipeline = pipeline_label("edge-sync", security_profile)
     REQUESTS.labels(SERVICE_NAME, pipeline, "sync").inc()
     PAYLOAD_SIZE.labels(SERVICE_NAME, pipeline, "result").observe(request.result_payload_kb)
+    log_pipeline_step(
+        "edge_summary_received",
+        "start",
+        pipeline,
+        request.input_id,
+        None,
+        source=request.source,
+        payload_kind="reduced_clinical_summary",
+        result_payload_kb=round(request.result_payload_kb, 3),
+        security_profile=security_profile,
+    )
     security_timings = await apply_security_profile(
         security_profile,
         pipeline,
         request.result_payload_kb,
     )
+    log_pipeline_step(
+        "edge_summary_storage",
+        "start",
+        pipeline,
+        request.input_id,
+        None,
+        stored_payload="edge_reduced_clinical_summary",
+    )
     storage_ms = await timed_async_sleep("storage", pipeline, STORAGE_MS)
+    log_pipeline_step(
+        "edge_summary_storage",
+        "done",
+        pipeline,
+        request.input_id,
+        None,
+        security_ms=round(security_timings["security_ms"], 3),
+        storage_ms=round(storage_ms, 3),
+    )
     return {
         "status": "stored",
         "service": SERVICE_NAME,

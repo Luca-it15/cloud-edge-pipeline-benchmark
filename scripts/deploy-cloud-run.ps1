@@ -4,6 +4,8 @@ param(
     [string]$Repository = "benchmark",
     [string]$Service = "benchmark-cloud-api",
     [string]$ImageName = "pipeline-api",
+    [ValidateRange(0, 10)]
+    [int]$MinInstances = 1,
     [string]$GcloudPath = ""
 )
 
@@ -53,7 +55,7 @@ if (-not $existingRepo) {
 Write-Host "Building and pushing $image"
 & $GcloudPath builds submit (Join-Path $root "services\pipeline_api") --tag $image
 
-Write-Host "Deploying Cloud Run service $Service"
+Write-Host "Deploying Cloud Run service $Service with min instances $MinInstances"
 & $GcloudPath run deploy $Service `
     --image $image `
     --region $Region `
@@ -63,8 +65,8 @@ Write-Host "Deploying Cloud Run service $Service"
     --cpu 1 `
     --concurrency 20 `
     --timeout 60 `
-    --min-instances 0 `
-    --set-env-vars "ROLE=cloud,SERVICE_NAME=cloud-api-gcp,TRANSPORT_SECURITY=platform_tls,NETWORK_UPLINK_MS=0,PREPROCESS_MS=24,INFERENCE_MS=36,STORAGE_MS=12,RESULT_PAYLOAD_RATIO=0.05,SECURE_TLS_HANDSHAKE_MS=18,SECURE_AUTH_MS=4,SECURE_CRYPTO_MS_PER_MB=7,SECURE_REPLAY_CHECK_MS=2,SECURE_PACKET_OVERHEAD_KB=2"
+    --min-instances $MinInstances `
+    --set-env-vars "ROLE=cloud,SERVICE_NAME=cloud-api-gcp,TRANSPORT_SECURITY=platform_tls,NETWORK_UPLINK_MS=0,PREPROCESS_MS=24,INFERENCE_MS=36,STORAGE_MS=12,RESULT_PAYLOAD_RATIO=0.05,PIPELINE_STEP_LOGS=true,LOG_LEVEL=INFO,SECURE_TLS_HANDSHAKE_MS=18,SECURE_AUTH_MS=4,SECURE_CRYPTO_MS_PER_MB=7,SECURE_REPLAY_CHECK_MS=2,SECURE_PACKET_OVERHEAD_KB=2"
 
 $cloudRunUrl = & $GcloudPath run services describe $Service `
     --region $Region `

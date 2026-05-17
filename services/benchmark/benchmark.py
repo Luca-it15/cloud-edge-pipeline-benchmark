@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import hashlib
 import json
 import os
 import statistics
@@ -7,6 +8,7 @@ import ssl
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -19,19 +21,20 @@ TLS_CA_FILE = os.getenv("TLS_CA_FILE", "")
 TLS_CLIENT_CERT_FILE = os.getenv("TLS_CLIENT_CERT_FILE", "")
 TLS_CLIENT_KEY_FILE = os.getenv("TLS_CLIENT_KEY_FILE", "")
 DATASET_PATH = Path(os.getenv("DATASET_PATH", "/app/data/patients.json"))
-DATASET_REPEATS = int(os.getenv("DATASET_REPEATS", "1"))
+DATASET_REPEATS = int(os.getenv("DATASET_REPEATS", "3"))
 COMPLEXITY = float(os.getenv("COMPLEXITY", "1.0"))
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "/app/results"))
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
 BENCHMARK_SCENARIOS = os.getenv(
     "BENCHMARK_SCENARIOS",
-    "cloud,edge,cloud_simulated_secure,edge_simulated_secure,cloud_tls,edge_tls",
+    "cloud,edge,edge_tls",
 )
 
 
 FIELDS = [
     "pipeline",
     "run_id",
+    "repeat",
     "input_id",
     "patient_id",
     "patient_name",
@@ -43,6 +46,8 @@ FIELDS = [
     "client_service_delta_ms",
     "security_profile",
     "transport_security",
+    "cold_start_candidate",
+    "process_age_ms",
     "network_ms",
     "security_ms",
     "tls_handshake_ms",
@@ -57,12 +62,22 @@ FIELDS = [
     "payload_synced_kb",
     "result_payload_kb",
     "security_overhead_kb",
+    "abnormal_vitals_count",
+    "abnormal_vitals",
     "risk_score",
     "risk_level",
     "recommended_action",
     "processing_mode",
     "alert",
 ]
+
+
+def patient_hash(patient_id: str) -> str:
+    return hashlib.sha256(patient_id.encode("utf-8")).hexdigest()[:12]
+
+
+def log_event(event: str, **fields: Any) -> None:
+    print(json.dumps({"event": event, **fields}, separators=(",", ":"), sort_keys=True, default=str), flush=True)
 
 
 def percentile(values: list[float], pct: float) -> float:
@@ -93,6 +108,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "mean_client_service_delta_ms": statistics.fmean(
                 float(row["client_service_delta_ms"]) for row in subset
             ),
+            "cold_start_requests": sum(1 for row in subset if row["cold_start_candidate"] == "true"),
             "mean_preprocess_ms": statistics.fmean(float(row["preprocess_ms"]) for row in subset),
             "mean_inference_ms": statistics.fmean(float(row["inference_ms"]) for row in subset),
             "mean_storage_ms": statistics.fmean(float(row["storage_ms"]) for row in subset),
@@ -100,6 +116,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "mean_payload_sent_kb": statistics.fmean(float(row["payload_sent_kb"]) for row in subset),
             "mean_payload_synced_kb": statistics.fmean(float(row["payload_synced_kb"]) for row in subset),
             "alerts": sum(1 for row in subset if row["alert"] == "true"),
+            "mean_abnormal_vitals": statistics.fmean(float(row["abnormal_vitals_count"]) for row in subset),
             "critical_patients": sum(1 for row in subset if row["risk_level"] == "critical"),
             "high_patients": sum(1 for row in subset if row["risk_level"] == "high"),
         }
@@ -110,8 +127,10 @@ def httpx_kwargs_for_url(url: str) -> dict[str, Any]:
     if not url.startswith("https://"):
         return {}
 
-    context = ssl.create_default_context(cafile=TLS_CA_FILE if TLS_CA_FILE else None)
-    if TLS_CLIENT_CERT_FILE and TLS_CLIENT_KEY_FILE:
+    host = urlparse(url).hostname or ""
+    local_tls_host = host in {"edge-api-tls", "localhost", "127.0.0.1"}
+    context = ssl.create_default_context(cafile=TLS_CA_FILE if local_tls_host and TLS_CA_FILE else None)
+    if local_tls_host and TLS_CLIENT_CERT_FILE and TLS_CLIENT_KEY_FILE:
         context.load_cert_chain(TLS_CLIENT_CERT_FILE, TLS_CLIENT_KEY_FILE)
     return {"verify": context}
 
@@ -121,10 +140,11 @@ async def run_one(
     pipeline: str,
     security_profile: str,
     run_id: int,
+    repeat: int,
     patient: dict[str, Any],
 ) -> dict[str, Any]:
     suffix = security_profile if security_profile != "none" else "plain"
-    input_id = f"{pipeline}-{suffix}-{patient['patient_id']}-{run_id:04d}"
+    input_id = f"{pipeline}-{suffix}-r{repeat}-{patient['patient_id']}-{run_id:04d}"
     payload = {
         "input_id": input_id,
         "complexity": COMPLEXITY,
@@ -132,6 +152,20 @@ async def run_one(
         "patient_record": patient,
     }
 
+    log_event(
+        "benchmark_pipeline_step",
+        step="request_start",
+        pipeline=pipeline,
+        security_profile=security_profile,
+        repeat=repeat,
+        input_id=input_id,
+        patient_hash=patient_hash(patient["patient_id"]),
+        ward=patient["ward"],
+        bed=patient["bed"],
+        diagnosis=patient["primary_diagnosis"],
+        vital_samples=len(patient.get("vitals", [])),
+        endpoint=url,
+    )
     start = time.perf_counter()
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(REQUEST_TIMEOUT_SECONDS),
@@ -146,10 +180,12 @@ async def run_one(
     service_total_ms = float(body["total_ms"])
     clinical = body["clinical"]
     risk = clinical["risk"] or {}
+    abnormal_vitals = risk.get("abnormal_vitals", [])
 
-    return {
+    row = {
         "pipeline": body["pipeline"],
         "run_id": run_id,
+        "repeat": repeat,
         "input_id": input_id,
         "patient_id": patient["patient_id"],
         "patient_name": patient["name"],
@@ -161,6 +197,8 @@ async def run_one(
         "client_service_delta_ms": round(client_total_ms - service_total_ms, 3),
         "security_profile": body["security_profile"],
         "transport_security": body.get("transport_security", "plain"),
+        "cold_start_candidate": "true" if body.get("cold_start_candidate") else "false",
+        "process_age_ms": round(float(body.get("process_age_ms", 0.0)), 3),
         "network_ms": round(float(timings.get("network_ms", 0.0)), 3),
         "security_ms": round(float(timings.get("security_ms", 0.0)), 3),
         "tls_handshake_ms": round(float(timings.get("tls_handshake_ms", 0.0)), 3),
@@ -175,6 +213,8 @@ async def run_one(
         "payload_synced_kb": round(float(body["payload_synced_kb"]), 3),
         "result_payload_kb": round(float(body["result_payload_kb"]), 3),
         "security_overhead_kb": round(float(body.get("security_overhead_kb", 0.0)), 3),
+        "abnormal_vitals_count": len(abnormal_vitals),
+        "abnormal_vitals": json.dumps(abnormal_vitals, separators=(",", ":")),
         "risk_score": risk.get("risk_score", 0),
         "risk_level": risk.get("risk_level", "unknown"),
         "recommended_action": risk.get("recommended_action", ""),
@@ -182,6 +222,26 @@ async def run_one(
         "alert": "true" if clinical["alert"] else "false",
         "_clinical": clinical,
     }
+    log_event(
+        "benchmark_pipeline_step",
+        step="request_done",
+        pipeline=row["pipeline"],
+        security_profile=row["security_profile"],
+        input_id=input_id,
+        repeat=repeat,
+        patient_hash=patient_hash(patient["patient_id"]),
+        risk_score=row["risk_score"],
+        risk_level=row["risk_level"],
+        alert=row["alert"] == "true",
+        client_total_ms=row["client_total_ms"],
+        service_total_ms=row["service_total_ms"],
+        cold_start_candidate=row["cold_start_candidate"] == "true",
+        process_age_ms=row["process_age_ms"],
+        payload_sent_kb=row["payload_sent_kb"],
+        payload_synced_kb=row["payload_synced_kb"],
+        abnormal_vitals_count=row["abnormal_vitals_count"],
+    )
+    return row
 
 
 def load_patients() -> list[dict[str, Any]]:
@@ -201,10 +261,12 @@ def dashboard_payload(rows: list[dict[str, Any]], patients: list[dict[str, Any]]
         comparisons.setdefault(patient_id, {})[row["pipeline"]] = {
             "client_total_ms": row["client_total_ms"],
             "service_total_ms": row["service_total_ms"],
-            "sync_ms": row["sync_ms"],
-            "payload_synced_kb": row["payload_synced_kb"],
+            "transport_security": row["transport_security"],
+            "payload_sent_kb": row["payload_sent_kb"],
+            "cold_start_candidate": row["cold_start_candidate"],
             "risk_score": row["risk_score"],
             "risk_level": row["risk_level"],
+            "alert": row["alert"] == "true",
         }
         if row["pipeline"] in {"edge", "edge_tls"}:
             current = latest_by_patient.get(patient_id)
@@ -230,6 +292,7 @@ def dashboard_payload(rows: list[dict[str, Any]], patients: list[dict[str, Any]]
                 "risk_score": row["risk_score"],
                 "risk_level": row["risk_level"],
                 "recommended_action": row["recommended_action"],
+                "abnormal_vitals": (row.get("_clinical", {}).get("risk") or {}).get("abnormal_vitals", []),
                 "alert": row["alert"] == "true",
                 "pipeline_comparison": comparisons.get(patient_id, {}),
             }
@@ -273,8 +336,6 @@ async def main() -> None:
     scenario_definitions = {
         "cloud": (CLOUD_URL, "cloud", "none"),
         "edge": (EDGE_URL, "edge", "none"),
-        "cloud_simulated_secure": (CLOUD_URL, "cloud", "simulated"),
-        "edge_simulated_secure": (EDGE_URL, "edge", "simulated"),
         "cloud_tls": (CLOUD_TLS_URL, "cloud", "tls"),
         "edge_tls": (EDGE_TLS_URL, "edge", "tls"),
     }
@@ -292,16 +353,28 @@ async def main() -> None:
         known = ", ".join(sorted(scenario_definitions))
         raise ValueError(f"Unknown benchmark scenarios: {unknown_scenarios}. Known scenarios: {known}")
     targets = [scenario_definitions[scenario] for scenario in requested_scenarios]
+    log_event(
+        "benchmark_run_start",
+        dataset_path=str(DATASET_PATH),
+        dataset_size=len(patients),
+        dataset_repeats=DATASET_REPEATS,
+        scenarios=requested_scenarios,
+        cloud_url=CLOUD_URL,
+        edge_url=EDGE_URL,
+        complexity=COMPLEXITY,
+    )
 
     run_id = 0
     for repeat in range(1, DATASET_REPEATS + 1):
         for patient in patients:
             run_id += 1
-            run_rows = []
-            for url, pipeline, security_profile in targets:
-                row = await run_one(url, pipeline, security_profile, run_id, patient)
-                run_rows.append(row)
-                rows.append(row)
+            run_rows = await asyncio.gather(
+                *[
+                    run_one(url, pipeline, security_profile, run_id, repeat, patient)
+                    for url, pipeline, security_profile in targets
+                ]
+            )
+            rows.extend(run_rows)
             max_risk = max(row["risk_score"] for row in run_rows)
             print(
                 f"patient={patient['patient_id']} repeat={repeat} max_risk={max_risk} "
@@ -322,6 +395,13 @@ async def main() -> None:
     dashboard_path = OUTPUT_DIR / "patient_results.json"
     dashboard_path.write_text(json.dumps(dashboard_payload(rows, patients, summary), indent=2), encoding="utf-8")
 
+    log_event(
+        "benchmark_run_done",
+        results_path=str(results_path),
+        summary_path=str(summary_path),
+        dashboard_path=str(dashboard_path),
+        rows=len(rows),
+    )
     print(f"wrote {results_path}")
     print(f"wrote {summary_path}")
     print(f"wrote {dashboard_path}")

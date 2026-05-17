@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import sys
 import time
@@ -14,6 +15,12 @@ PORT = int(os.getenv("PORT", "8090"))
 BENCHMARK_SCRIPT = Path(os.getenv("BENCHMARK_SCRIPT", "/app/benchmark.py"))
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "/app/results"))
 DATASET_PATH = os.getenv("DATASET_PATH", "/app/data/patients.json")
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("benchmark-control")
 
 RUN_ENV_KEYS = [
     "CLOUD_URL",
@@ -82,6 +89,7 @@ async def collect_output(stream: asyncio.StreamReader) -> None:
         if not line:
             break
         text = line.decode("utf-8", errors="replace").rstrip()
+        logger.info("benchmark-runner %s", text)
         state.output_tail.append(text)
         state.output_tail = state.output_tail[-80:]
 
@@ -89,6 +97,14 @@ async def collect_output(stream: asyncio.StreamReader) -> None:
 async def run_benchmark_process() -> None:
     try:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "starting benchmark process script=%s dataset=%s scenarios=%s cloud_url=%s edge_url=%s",
+            BENCHMARK_SCRIPT,
+            DATASET_PATH,
+            os.getenv("BENCHMARK_SCENARIOS", ""),
+            os.getenv("CLOUD_URL", ""),
+            os.getenv("EDGE_URL", ""),
+        )
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             str(BENCHMARK_SCRIPT),
@@ -105,11 +121,13 @@ async def run_benchmark_process() -> None:
         state.status = "completed" if state.return_code == 0 else "failed"
         if state.return_code != 0:
             state.error = f"Benchmark exited with code {state.return_code}"
+        logger.info("benchmark process finished status=%s return_code=%s", state.status, state.return_code)
     except Exception as exc:
         state.return_code = None
         state.finished_at = utc_now()
         state.status = "failed"
         state.error = str(exc)
+        logger.exception("benchmark process failed")
     finally:
         state.process = None
 
@@ -143,6 +161,7 @@ async def run(request: RunRequest) -> dict[str, Any]:
         state.return_code = None
         state.error = None
         state.output_tail = []
+        logger.info("benchmark run requested force=%s", request.force)
         asyncio.create_task(run_benchmark_process())
         return state.snapshot()
 

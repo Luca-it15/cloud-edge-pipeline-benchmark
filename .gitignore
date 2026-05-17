@@ -6,3 +6,4 @@ results/*.csv
 results/*.json
 .env.gcp
 prometheus/prometheus.gcp.yml
+prometheus/prometheus.gcp.with-cloud.yml

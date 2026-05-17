@@ -45,7 +45,6 @@ SECURE_CRYPTO_MS_PER_MB = float(os.getenv("SECURE_CRYPTO_MS_PER_MB", "7"))
 SECURE_REPLAY_CHECK_MS = float(os.getenv("SECURE_REPLAY_CHECK_MS", "2"))
 SECURE_PACKET_OVERHEAD_KB = float(os.getenv("SECURE_PACKET_OVERHEAD_KB", "2"))
 PIPELINE_STEP_LOGS = os.getenv("PIPELINE_STEP_LOGS", "true").lower() == "true"
-PROCESS_STARTED_AT = time.time()
 
 
 logging.basicConfig(
@@ -90,14 +89,6 @@ IN_FLIGHT = Gauge(
     "Requests currently being processed.",
     ["service", "pipeline"],
 )
-PROCESS_STARTED_AT_SECONDS = Gauge(
-    "pipeline_process_started_at_seconds",
-    "Unix timestamp for the current service process start.",
-    ["service", "role"],
-)
-PROCESS_STARTED_AT_SECONDS.labels(SERVICE_NAME, ROLE).set(PROCESS_STARTED_AT)
-
-
 class ProcessRequest(BaseModel):
     input_id: str = Field(..., examples=["sample-001"])
     data_size_kb: int = Field(512, ge=1, le=65536)
@@ -334,7 +325,6 @@ async def process(request: ProcessRequest) -> dict[str, Any]:
             initial_risk_score=(request.initial_risk_assessment or {}).get("risk_score"),
             initial_risk_level=(request.initial_risk_assessment or {}).get("risk_level"),
             cloud_sync_enabled=bool(CLOUD_SYNC_URL),
-            process_age_ms=round((time.time() - PROCESS_STARTED_AT) * 1000, 3),
         )
         log_pipeline_step(
             "network_uplink",
@@ -548,7 +538,6 @@ async def process(request: ProcessRequest) -> dict[str, Any]:
             "security_profile": security_profile,
             "transport_security": TRANSPORT_SECURITY,
             "initial_risk_assessment": request.initial_risk_assessment,
-            "process_age_ms": round((time.time() - PROCESS_STARTED_AT) * 1000, 3),
             "input_id": request.input_id,
             "payload_sent_kb": payload_sent_kb,
             "payload_synced_kb": payload_synced_kb,

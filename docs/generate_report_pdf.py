@@ -420,12 +420,7 @@ Local machine / hospital edge
 """))
     story.append(
         p(
-            "The deployment script uses MinInstances=1 by default to keep the cloud service warm for a stable edge/cloud comparison. Passing MinInstances=0 or updating the service to --min-instances 0 enables separate Cloud Run cold-start experiments, but the application benchmark does not expose a cold-start counter because a local first-request flag would not represent real infrastructure startup."
-        )
-    )
-    story.append(
-        p(
-            "Earlier versions exposed a cold_start_candidate value based on the first /process request observed by a Python process. That value was removed from the API response, benchmark CSV, dashboard summary, Prometheus metrics, and report because it only marked a local first request and could be mistaken for the real Cloud Run service startup time."
+            "The deployment script uses MinInstances=1 by default to keep Cloud Run warm during the benchmark and make the edge/cloud comparison more stable."
         )
     )
     story.append(h2("Execution path"))
@@ -520,7 +515,6 @@ edge_tls
                 "Mean round trip is measured by the benchmark client and includes transport, HTTP/TLS overhead, service execution, and scheduling effects.",
                 "Mean service in the dashboard is computed from the internal processing stages: preprocess, inference, storage, and sync.",
                 "The edge and edge_tls service means are expected to be close to each other because real TLS overhead is mostly outside the internal service-stage sum.",
-                "The dashboard no longer shows cold starts. Real Cloud Run cold-start analysis should be handled as a separate infrastructure experiment with min-instances=0 and Cloud Monitoring or controlled request timing.",
             ]
         )
     )
@@ -546,7 +540,6 @@ results/patient_results.json
         ["service_total_ms", "Time measured inside the API handler."],
         ["client_service_delta_ms", "Client-side overhead not measured inside the service. TLS handshake and HTTP overhead mainly appear here."],
         ["transport_security", "plain, tls, or platform_tls."],
-        ["process_age_ms", "Age of the service process when it handled the request."],
         ["network_ms", "Configured network delay stage."],
         ["preprocess_ms", "Wearable payload validation stage."],
         ["inference_ms", "Out-of-range threshold check and alert generation stage."],
@@ -570,7 +563,6 @@ results/patient_results.json
                 "Diagnosis, medications, comorbidities, risk score, out-of-range values, and recommended action.",
                 "Per-patient comparison of cloud, edge, and edge_tls latency, service time, transport, payload, and risk result.",
                 "Latency table with runs, mean round trip, p99 round trip, and mean service for each scenario.",
-                "No cold-start column: the previous local first-request marker was removed because it did not measure true infrastructure startup.",
                 "Ward load and active alert count.",
                 "Critical-patient dialog after a benchmark run when critical results are present.",
             ]
@@ -594,17 +586,16 @@ pipeline_total_latency_ms
 pipeline_stage_latency_ms
 pipeline_payload_size_kb
 pipeline_in_flight_requests
-pipeline_process_started_at_seconds
 """))
     story.append(
         p(
-            "The default Prometheus configuration scrapes only the local edge services. This avoids accidental Cloud Run warm-up before latency tests. If cloud application metrics are needed, configure-gcp-hybrid.ps1 also generates prometheus.gcp.with-cloud.yml and docker-compose.cloud-metrics.yml can mount it."
+            "The default Prometheus configuration scrapes only the local edge services, keeping monitoring traffic separate from benchmark traffic. If cloud application metrics are needed, configure-gcp-hybrid.ps1 also generates prometheus.gcp.with-cloud.yml and docker-compose.cloud-metrics.yml can mount it."
         )
     )
     story.append(h2("Structured pipeline logs"))
     story.append(
         p(
-            "Both Cloud Run and local edge services emit JSON log events named clinical_pipeline_step. They include pseudonymized patient hash, ward, bed, diagnosis, vital-sample count, clinical fields used, timing, risk result, abnormal vital details, and process age. Patient names and raw vital values are not logged in the step context."
+            "Both Cloud Run and local edge services emit JSON log events named clinical_pipeline_step. They include pseudonymized patient hash, ward, bed, diagnosis, vital-sample count, clinical fields used, timing, risk result, and abnormal vital details. Patient names and raw vital values are not logged in the step context."
         )
     )
     story.append(pre("""
@@ -629,11 +620,6 @@ docker compose --env-file .env.gcp up --build
 
 docker compose --env-file .env.gcp run --rm benchmark
 
-powershell -ExecutionPolicy Bypass -File scripts\\deploy-cloud-run.ps1 `
-  -ProjectId benchmark-edge-cloud `
-  -Region europe-west8 `
-  -MinInstances 0
-
 docker compose ps
 docker compose logs -f edge-api edge-api-tls benchmark-api hospital-dashboard
 docker compose down
@@ -648,8 +634,6 @@ docker compose down
                 "The edge is emulated through Docker CPU/RAM limits, not real bedside hardware.",
                 "The edge TLS certificate is local and self-signed for benchmarking, not production use.",
                 "Cloud Run HTTPS is real but terminated by the Google Cloud platform rather than the application container.",
-                "The benchmark no longer reports cold starts because a process-local first-request marker would be a misleading proxy for real service startup.",
-                "Real Cloud Run cold-start experiments require separate control of min-instances, warm-up traffic, monitoring scrapes, and request timing.",
                 "The cloud benchmark depends on the local network path from the workstation to Google Cloud Europe.",
                 "Network delay is simulated at application level; a stronger network study could use tc netem, Mininet, or Containernet.",
             ]

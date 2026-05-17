@@ -194,18 +194,7 @@ Deploy the cloud container:
 .\scripts\deploy-cloud-run.ps1 -ProjectId benchmark-edge-cloud -Region europe-west8
 ```
 
-The script uses `-MinInstances 1` by default to keep Cloud Run warm during the benchmark and make the edge/cloud comparison more stable. For separate experiments on real Cloud Run cold starts, use:
-
-```powershell
-.\scripts\deploy-cloud-run.ps1 -ProjectId benchmark-edge-cloud -Region europe-west8 -MinInstances 0
-```
-
-Or, if the service is already deployed:
-
-```powershell
-gcloud run services update benchmark-cloud-api --region europe-west8 --min-instances 0
-gcloud run services update benchmark-cloud-api --region europe-west8 --min-instances 1
-```
+The script uses `-MinInstances 1` by default to keep Cloud Run warm during the benchmark and make the edge/cloud comparison more stable.
 
 The script:
 
@@ -299,7 +288,6 @@ pipeline_total_latency_ms
 pipeline_stage_latency_ms
 pipeline_payload_size_kb
 pipeline_in_flight_requests
-pipeline_process_started_at_seconds
 ```
 
 Grafana visualizes these metrics over time. By default, Prometheus scrapes only the local edge, so monitoring traffic stays separate from benchmark traffic.
@@ -316,7 +304,7 @@ Start with cloud scraping enabled:
 docker compose --env-file .env.gcp -f docker-compose.yml -f docker-compose.cloud-metrics.yml up --build
 ```
 
-Note: a Prometheus scrape against Cloud Run is a real HTTP request, so it can cold-start an instance or keep it warm. The application benchmark no longer exposes a cold-start counter because a local "first request in process" flag does not represent the service's real infrastructure startup. For cloud infrastructure metrics without disturbing application traffic, use Google Cloud Monitoring.
+Note: a Prometheus scrape against Cloud Run is a real HTTP request, so it can alter the traffic observed by the benchmark. For cloud infrastructure metrics without disturbing application traffic, use Google Cloud Monitoring.
 
 ## Pipeline Logs
 
@@ -332,7 +320,7 @@ cloud_storage
 dashboard_response
 ```
 
-The logs include the pseudonymized patient hash, ward, bed, diagnosis, vital-sample count, clinical fields used, sent payload, computed risk, process age, and per-step timings. Patient names and raw vital-sign values are not printed.
+The logs include the pseudonymized patient hash, ward, bed, diagnosis, vital-sample count, clinical fields used, sent payload, computed risk, and per-step timings. Patient names and raw vital-sign values are not printed.
 
 The local edge is configured as `ward-gateway-0.5vcpu-256mb` with:
 
